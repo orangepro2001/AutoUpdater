@@ -1,0 +1,23 @@
+[package]
+name = "ghost-updater-tauri"
+description = "ghost-updater 推送端 GUI(Tauri 2):主机列表、批量推更、实时日志"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+# 独立于主 workspace:generate_context! 编译期读 ../webdist,需先 npm run build
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+ghost-updater-cli = { path = "../../ghost-updater-cli" }
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+strip = true
+lto = true

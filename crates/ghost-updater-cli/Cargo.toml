@@ -1,0 +1,23 @@
+[package]
+name = "ghost-updater-cli"
+description = "ghost-updater 推送端:探测/暂存/触发/轮询编排,GUI 与 CLI 共用的库 + ghost-push 命令行"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ghost-push"
+path = "src/main.rs"
+
+[dependencies]
+ghost-updater-core = { path = "../ghost-updater-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tar = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+tokio-util = { workspace = true }

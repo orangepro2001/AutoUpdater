@@ -1,0 +1,21 @@
+[package]
+name = "ghost-updater-net"
+description = "ghost-updater 网络层:可嵌入任意 Axum 服务的 /update/* 路由(probe/stage/apply)与独立 agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ghost-updater-core = { path = "../ghost-updater-core" }
+axum = { workspace = true }
+tokio = { workspace = true }
+http-body-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tar = { workspace = true }
+ed25519-dalek = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }

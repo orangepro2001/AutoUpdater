@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+# ghost-updater-tauri 排除在外:generate_context! 编译期读 frontendDist(webdist),
+# 需要先 npm run build;独立构建,见 crates/ghost-updater-tauri。
+members = [
+    "crates/ghost-updater-core",
+    "crates/ghost-updater-net",
+    "crates/ghost-updater-cli",
+    "crates/demo-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+tar = "0.4"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[profile.release]
+strip = true
+lto = true

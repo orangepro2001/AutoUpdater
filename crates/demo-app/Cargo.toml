@@ -1,0 +1,16 @@
+[package]
+name = "demo-app"
+description = "演示宿主:main 顶部一行 guard + axum 合并 /update/* 路由,即完成一键更新接入"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ghost-demo"
+path = "src/main.rs"
+
+[dependencies]
+ghost-updater-core = { path = "../ghost-updater-core" }
+ghost-updater-net = { path = "../ghost-updater-net" }
+axum = { workspace = true }
+tokio = { workspace = true }

@@ -1,0 +1,95 @@
+:root {
+  color-scheme: dark;
+  --bg: #12141a;
+  --panel: #1a1d26;
+  --panel2: #20242f;
+  --line: #2c313e;
+  --fg: #d7dae2;
+  --dim: #8b91a0;
+  --acc: #4f9cf9;
+  --ok: #3fb96f;
+  --bad: #e2564f;
+  --warn: #d9a03f;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.5 "Segoe UI", "Microsoft YaHei", sans-serif;
+  user-select: none;
+}
+
+#app { padding: 14px; height: 100vh; display: flex; flex-direction: column; gap: 12px; }
+
+h2 { font-size: 13px; margin: 0 0 8px; color: var(--dim); font-weight: 600; letter-spacing: 1px; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.grow { flex: 1; }
+
+input[type="text"], input[type="password"] {
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--fg);
+  padding: 6px 9px;
+  outline: none;
+  min-width: 0;
+}
+input:focus { border-color: var(--acc); }
+
+button {
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--fg);
+  padding: 6px 14px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+button:hover { border-color: var(--acc); color: #fff; }
+button:disabled { opacity: 0.45; cursor: default; }
+button.primary { background: var(--acc); border-color: var(--acc); color: #fff; }
+button.danger { background: transparent; border-color: var(--bad); color: var(--bad); }
+
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; color: var(--dim); font-weight: 500; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+td { padding: 6px 8px; border-bottom: 1px solid var(--line); }
+tr:hover td { background: rgba(79, 156, 249, 0.05); }
+
+.badge { padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+.badge.on { background: rgba(63, 185, 111, 0.15); color: var(--ok); }
+.badge.off { background: rgba(226, 86, 79, 0.15); color: var(--bad); }
+.badge.idle { background: var(--panel2); color: var(--dim); }
+
+.meta { color: var(--dim); font-size: 12px; }
+.sha { font-family: Consolas, monospace; color: var(--warn); font-size: 12px; word-break: break-all; }
+
+#log {
+  flex: 1;
+  min-height: 140px;
+  overflow-y: auto;
+  background: #0d0f14;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font: 12px/1.6 Consolas, "Cascadia Mono", monospace;
+  user-select: text;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.log-line { color: var(--dim); }
+.log-line .tag { font-weight: 700; }
+.err { color: var(--bad); }
+.okline { color: var(--ok); }
+
+.hint { color: var(--dim); font-size: 12px; }

@@ -1,0 +1,6 @@
+/target
+crates/ghost-updater-tauri/src-tauri/target
+crates/ghost-updater-tauri/node_modules
+crates/ghost-updater-tauri/webdist
+*.update_backup/
+.ghost-update/
