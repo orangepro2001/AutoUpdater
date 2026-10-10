@@ -4,6 +4,12 @@
   import { onMount } from "svelte";
 
   interface HostEntry { addr: string }
+  // 一个项目 = 更新包配置 + 默认端口 + 目标主机列表,整档保存(apps.json)
+  interface AppProfile {
+    name: string; port: number; hosts: HostEntry[];
+    dist_dir: string; main_exe: string; overwrite_config: boolean;
+    token: string; sign_key: string; timeout_secs: number;
+  }
   interface ProbeResult {
     addr: string; reachable: boolean; version: string; started_at: number;
     os: string; arch: string; pubkey_fingerprint: string; error: string;
@@ -28,19 +34,36 @@
   }
   interface LogLine { addr: string; line: string }
 
-  // ---- 更新包配置 ----
-  let distDir = "";
-  let mainExe = "";
-  let overwriteConfig = false;
-  let token = "";
-  let signKey = "";
-  let timeoutSecs = 120;
+  // ---- 更新包配置直接读写当前项目(apps[activeIdx]),切换项目即随档切换 ----
   let dist: DistInfo | null = null;
   let distError = "";
 
-  // ---- 主机 ----
+  // ---- 项目配置(每套 = 更新包设置 + 项目名 + 默认端口 + 机器列表) ----
+  function blankProject(name: string, port = 7600): AppProfile {
+    return {
+      name, port, hosts: [],
+      dist_dir: "", main_exe: "", overwrite_config: false,
+      token: "", sign_key: "", timeout_secs: 120,
+    };
+  }
+  let apps: AppProfile[] = [blankProject("项目A")];
+  let activeIdx = 0;
+  $: active = apps[activeIdx];
+  // 函数内一律用 currentProject():active 是 $: 派生,同步改 activeIdx 后尚未刷新,
+  // switchApp 里紧接着读 active 会拿到上一个项目。
+  const currentProject = (): AppProfile | undefined => apps[activeIdx];
+
+  // ---- 当前应用的主机工作列表 ----
   let hosts: HostState[] = [];
-  let newAddr = "";
+  let newIp = "";
+  let newPort = 7600;
+  let batchOpen = false;
+  let batchText = "";
+  let importFrom = "";
+  let addingApp = false;
+  let newName = "";
+  let renaming = false;
+  let renameText = "";
   let logs: { addr: string; line: string; at: string }[] = [];
   let pushing = false;
   let logEl: HTMLElement;
@@ -65,10 +88,9 @@
     return hosts.find((h) => h.addr === addr);
   }
 
-  // ---- 主机列表持久化 ----
-  async function loadHosts() {
-    const saved = await invoke<HostEntry[]>("load_hosts");
-    hosts = saved.map((e) => freshHost(e.addr));
+  function pushLog(addr: string, line: string) {
+    logs = [...logs.slice(-500), { addr, line, at: now() }];
+    if (logEl) logEl.scrollTop = logEl.scrollHeight;
   }
 
   function freshHost(addr: string): HostState {
@@ -78,23 +100,140 @@
     };
   }
 
-  async function persistHosts() {
-    const entries: HostEntry[] = hosts.map((h) => ({ addr: h.addr }));
-    await invoke("save_hosts", { hosts: entries });
+  // ip:端口 已带端口就用原样;裸 IP 补当前应用默认端口
+  function makeAddr(ip: string, port: number | string): string {
+    ip = ip.trim();
+    if (!ip) return "";
+    if (ip.includes(":")) return ip;
+    const p = Number(port);
+    if (!(p >= 1 && p <= 65535)) return "";
+    return `${ip}:${p}`;
   }
 
+  // ---- 项目配置持久化 ----
+  async function loadApps() {
+    apps = await invoke<AppProfile[]>("load_apps");
+    if (apps.length === 0) apps = [blankProject("项目A")];
+    await switchApp(0, false);
+  }
+
+  // 主机列表是独立工作态,保存前同步回当前项目
+  async function persistApps() {
+    const p = currentProject();
+    if (p) p.hosts = hosts.map((h) => ({ addr: h.addr }));
+    apps = apps; // 触发下拉框选项文本(台数/端口)重渲染
+    await invoke("save_apps", { apps });
+  }
+
+  // 更新包输入框用:改动防抖落盘
+  let saveTimer: ReturnType<typeof setTimeout> | undefined;
+  function persistProject() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => { persistApps().catch(() => {}); }, 300);
+  }
+
+  async function switchApp(i: number, autoprobe = true) {
+    activeIdx = i;
+    hosts = apps[i].hosts.map((e) => freshHost(e.addr));
+    newPort = apps[i].port;
+    importFrom = "";
+    dist = null;
+    distError = "";
+    if (apps[i].dist_dir?.trim()) refreshDist();
+    if (autoprobe) hosts.forEach((h) => probeOne(h.addr));
+  }
+
+  function uniqueName(base: string): string {
+    if (!apps.some((a) => a.name === base)) return base;
+    for (let n = 2; ; n++) {
+      const name = `${base}-${n}`;
+      if (!apps.some((a) => a.name === name)) return name;
+    }
+  }
+
+  async function createApp() {
+    const name = uniqueName(newName.trim() || `项目${apps.length + 1}`);
+    apps = [...apps, blankProject(name, newPort || 7600)];
+    newName = "";
+    addingApp = false;
+    await switchApp(apps.length - 1, false);
+    await persistApps();
+  }
+
+  async function renameApp() {
+    const n = renameText.trim();
+    if (n && active) {
+      active.name = n;
+      apps = apps;
+      await persistApps();
+    }
+    renaming = false;
+  }
+
+  async function deleteApp() {
+    apps = apps.filter((_, i) => i !== activeIdx);
+    if (apps.length === 0) apps = [blankProject("项目A")];
+    await switchApp(Math.max(0, Math.min(activeIdx, apps.length - 1)), false);
+    await persistApps();
+  }
+
+  async function changePort() {
+    if (!active) return;
+    let p = Number(String(active.port).replace(/\D/g, ""));
+    if (!(p >= 1 && p <= 65535)) p = 7600;
+    active.port = p;
+    newPort = p;
+    apps = apps;
+    await persistApps();
+  }
+
+  // ---- 主机增删 ----
   async function addHost() {
-    const a = newAddr.trim();
+    const a = makeAddr(newIp, newPort);
     if (!a || hosts.some((h) => h.addr === a)) return;
     hosts = [...hosts, freshHost(a)];
-    newAddr = "";
-    await persistHosts();
+    newIp = "";
+    await persistApps();
     probeOne(a);
   }
 
   async function removeHost(addr: string) {
     hosts = hosts.filter((h) => h.addr !== addr);
-    await persistHosts();
+    await persistApps();
+  }
+
+  // 批量添加:一行/一条一个 IP 或 ip:端口,逗号空格分隔也行
+  async function batchAdd() {
+    const tokens = batchText.split(/[\s,;，；]+/).filter(Boolean);
+    const fresh: HostState[] = [];
+    for (const t of tokens) {
+      const a = makeAddr(t, newPort);
+      if (a && !hosts.some((h) => h.addr === a) && !fresh.some((h) => h.addr === a))
+        fresh.push(freshHost(a));
+    }
+    if (fresh.length === 0) return;
+    hosts = [...hosts, ...fresh];
+    batchText = "";
+    await persistApps();
+    pushLog("批量添加", `新增 ${fresh.length} 台,跳过无效/重复 ${tokens.length - fresh.length} 条`);
+    fresh.forEach((h) => probeOne(h.addr));
+  }
+
+  // 把另一个应用配置好的机器整批导入(端口随源配置逐台保留)
+  async function importHosts() {
+    const src = apps.find((a) => a.name === importFrom);
+    if (!src) return;
+    const fresh: HostState[] = [];
+    for (const e of src.hosts) {
+      if (!hosts.some((h) => h.addr === e.addr) && !fresh.some((h) => h.addr === e.addr))
+        fresh.push(freshHost(e.addr));
+    }
+    if (fresh.length === 0) return;
+    hosts = [...hosts, ...fresh];
+    importFrom = "";
+    await persistApps();
+    pushLog("导入机器", `从「${src.name}」导入 ${fresh.length} 台`);
+    fresh.forEach((h) => probeOne(h.addr));
   }
 
   // ---- 探测 ----
@@ -104,7 +243,7 @@
     h.probing = true;
     hosts = hosts;
     try {
-      const r = await invoke<ProbeResult>("cmd_probe", { addr, token: token || null });
+      const r = await invoke<ProbeResult>("cmd_probe", { addr, token: currentProject()?.token || null });
       h.reachable = r.reachable;
       h.version = r.version;
       h.os = r.os;
@@ -126,12 +265,14 @@
   async function refreshDist() {
     distError = "";
     dist = null;
-    if (!distDir.trim()) return;
+    const p = currentProject();
+    const dir = p?.dist_dir?.trim() || "";
+    if (!dir) return;
     try {
       const r = await invoke<DistInfo>("cmd_dist_info", {
-        distDir: distDir.trim(),
-        main: mainExe.trim() || null,
-        overwriteConfig,
+        distDir: dir,
+        main: p?.main_exe?.trim() || null,
+        overwriteConfig: !!p?.overwrite_config,
       });
       if (r.ok) dist = r;
       else distError = r.error;
@@ -145,16 +286,17 @@
     if (pushing || targets.length === 0 || !dist?.ok) return;
     pushing = true;
     hosts = hosts.map((h) => (targets.includes(h.addr) ? { ...h, updating: true } : h));
+    const p = currentProject();
     const jobs = targets.map(async (addr) => {
       try {
         const r = await invoke<any>("cmd_update_host", {
           addr,
-          distDir: distDir.trim(),
-          main: mainExe.trim() || null,
-          token: token || null,
-          signKey: signKey.trim() || null,
-          overwriteConfig,
-          timeoutSecs,
+          distDir: p?.dist_dir?.trim() || "",
+          main: p?.main_exe?.trim() || null,
+          token: p?.token || null,
+          signKey: p?.sign_key?.trim() || null,
+          overwriteConfig: !!p?.overwrite_config,
+          timeoutSecs: Number(p?.timeout_secs) || 120,
         });
         const h = findHost(addr);
         if (h) {
@@ -190,29 +332,27 @@
     updateHosts(hosts.filter((h) => h.lastResult && !h.lastOk).map((h) => h.addr));
 
   onMount(async () => {
-    await loadHosts();
+    await loadApps();
     await listen<LogLine>("update-log", (e) => {
       const { addr, line } = e.payload;
-      logs = [...logs.slice(-500), { addr, line, at: now() }];
-      if (logEl) logEl.scrollTop = logEl.scrollHeight;
+      pushLog(addr, line);
     });
-    hosts.forEach((h) => probeOne(h.addr));
   });
 </script>
 
 <div class="panel">
-  <h2>更新包</h2>
+  <h2>更新包 <span class="meta">· 随项目「{active?.name || ""}」保存</span></h2>
   <div class="row">
-    <input type="text" class="grow" placeholder="新版 dist 目录,如 D:\dist" bind:value={distDir} on:change={refreshDist} />
-    <input type="text" style="width: 130px" placeholder="主程序(可选)" bind:value={mainExe} on:change={refreshDist} />
-    <label class="hint"><input type="checkbox" bind:checked={overwriteConfig} on:change={refreshDist} /> 覆盖 config.json</label>
+    <input type="text" class="grow" placeholder="新版 dist 目录,如 D:\dist" bind:value={active.dist_dir} on:change={() => { refreshDist(); persistProject(); }} />
+    <input type="text" style="width: 130px" placeholder="主程序(可选)" bind:value={active.main_exe} on:change={() => { refreshDist(); persistProject(); }} />
+    <label class="hint"><input type="checkbox" bind:checked={active.overwrite_config} on:change={() => { refreshDist(); persistProject(); }} /> 覆盖 config.json</label>
     <button on:click={refreshDist}>重新计算</button>
   </div>
   <div class="row" style="margin-top: 8px">
-    <input type="password" style="width: 200px" placeholder="Token(可选)" bind:value={token} />
-    <input type="password" style="width: 200px" placeholder="签名私钥 hex(可选)" bind:value={signKey} />
+    <input type="password" style="width: 200px" placeholder="Token(可选)" bind:value={active.token} on:change={persistProject} />
+    <input type="password" style="width: 200px" placeholder="签名私钥 hex(可选)" bind:value={active.sign_key} on:change={persistProject} />
     <span class="hint">轮询超时</span>
-    <input type="text" style="width: 60px" bind:value={timeoutSecs} />
+    <input type="text" style="width: 60px" bind:value={active.timeout_secs} on:change={persistProject} />
     <span class="hint">秒</span>
   </div>
   {#if dist}
@@ -229,9 +369,63 @@
 
 <div class="panel">
   <div class="row">
-    <h2 class="grow">主机({hosts.length})</h2>
-    <input type="text" style="width: 220px" placeholder="IP[:7600]" bind:value={newAddr} on:keydown={(e) => e.key === "Enter" && addHost()} />
+    {#if renaming}
+      <h2 class="grow">项目</h2>
+      <input type="text" style="width: 220px" bind:value={renameText}
+        on:keydown={(e) => { if (e.key === "Enter") renameApp(); if (e.key === "Escape") renaming = false; }} />
+      <button class="primary" on:click={renameApp}>确定</button>
+      <button on:click={() => (renaming = false)}>取消</button>
+    {:else if addingApp}
+      <h2 class="grow">项目</h2>
+      <input type="text" style="width: 220px" placeholder="新项目名,如 项目C" bind:value={newName}
+        on:keydown={(e) => { if (e.key === "Enter") createApp(); if (e.key === "Escape") (addingApp = false); }} />
+      <button class="primary" on:click={createApp}>创建</button>
+      <button on:click={() => (addingApp = false)}>取消</button>
+    {:else}
+      <h2 class="grow">项目(推送对象)</h2>
+      <select bind:value={activeIdx} on:change={() => switchApp(activeIdx)}>
+        {#each apps as a, i}
+          <option value={i}>{a.name} · {a.hosts.length}台 · 端口{a.port}</option>
+        {/each}
+      </select>
+      <button on:click={() => { renaming = true; renameText = active?.name || ""; }}>改名</button>
+      <button on:click={() => { addingApp = true; newName = ""; }}>新增项目</button>
+      <button class="danger" on:click={deleteApp}>删除项目</button>
+      <span class="hint">默认端口</span>
+      <input type="text" style="width: 60px" bind:value={active.port} on:change={changePort} />
+    {/if}
+  </div>
+
+  {#if batchOpen}
+    <div class="row" style="margin-top: 8px">
+      <textarea class="grow" rows="3" bind:value={batchText}
+        placeholder="粘贴机器列表一次添加:每行一个 IP(端口用上方默认端口),也可写 ip:端口 覆盖;空格/逗号分隔均可&#10;192.168.1.60&#10;192.168.1.61:7601"></textarea>
+    </div>
+    <div class="row" style="margin-top: 6px">
+      <button class="primary" on:click={batchAdd}>批量添加</button>
+      <select bind:value={importFrom}>
+        <option value="" disabled>从其他项目整批导入已配好的机器…</option>
+        {#each apps as a, i}
+          {#if i !== activeIdx}
+            <option value={a.name}>{a.name}({a.hosts.length}台)</option>
+          {/if}
+        {/each}
+      </select>
+      <button on:click={importHosts} disabled={!importFrom}>导入</button>
+      <span class="grow"></span>
+      <button on:click={() => (batchOpen = false)}>收起</button>
+    </div>
+  {/if}
+
+  <div class="row" style="margin-top: 8px">
+    <h2 class="grow">{active?.name || ""} 主机({hosts.length})</h2>
+    <input type="text" style="width: 200px" placeholder="IP,如 192.168.1.60" bind:value={newIp}
+      on:keydown={(e) => e.key === "Enter" && addHost()} />
+    <span class="hint">:</span>
+    <input type="text" style="width: 64px" bind:value={newPort}
+      on:keydown={(e) => e.key === "Enter" && addHost()} />
     <button on:click={addHost}>添加</button>
+    <button on:click={() => (batchOpen = !batchOpen)}>{batchOpen ? "收起批量" : "批量添加"}</button>
     <button on:click={probeAll} disabled={pushing}>探测全部</button>
     <button on:click={updateSelected} disabled={pushing || !dist?.ok}>更新选中</button>
     <button on:click={retryFailed} disabled={pushing || !dist?.ok}>重试失败</button>
@@ -275,7 +469,9 @@
           </td>
         </tr>
       {:else}
-        <tr><td colspan="7" class="meta" style="text-align: center; padding: 18px">添加目标主机地址开始(目标需已集成 ghost-updater)</td></tr>
+        <tr><td colspan="7" class="meta" style="text-align: center; padding: 18px">
+          「{active?.name}」还没有机器:填 IP 添加,或用「批量添加」粘一排 IP 一次全加
+        </td></tr>
       {/each}
     </tbody>
   </table>

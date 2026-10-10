@@ -36,7 +36,7 @@ h2 { font-size: 13px; margin: 0 0 8px; color: var(--dim); font-weight: 600; lett
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .grow { flex: 1; }
 
-input[type="text"], input[type="password"] {
+input[type="text"], input[type="password"], select, textarea {
   background: var(--panel2);
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -44,8 +44,10 @@ input[type="text"], input[type="password"] {
   padding: 6px 9px;
   outline: none;
   min-width: 0;
+  font: inherit;
 }
-input:focus { border-color: var(--acc); }
+textarea { resize: vertical; font-family: Consolas, "Cascadia Mono", monospace; }
+input:focus, select:focus, textarea:focus { border-color: var(--acc); }
 
 button {
   background: var(--panel2);

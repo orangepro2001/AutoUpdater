@@ -9,10 +9,55 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager};
 
-/// 主机列表条目(持久化到 app_config_dir/hosts.json)
+/// 主机列表条目(随项目配置持久化)
 #[derive(Serialize, Deserialize, Clone)]
 struct HostEntry {
     addr: String,
+}
+
+fn default_timeout() -> u32 {
+    120
+}
+
+/// 项目配置:一个集成了更新接口的目标应用 = 更新包配置 + 默认端口 + 机器列表,整档保存
+#[derive(Serialize, Deserialize, Clone)]
+struct AppProfile {
+    name: String,
+    port: u16,
+    hosts: Vec<HostEntry>,
+    /// 本机新版 dist 目录
+    #[serde(default)]
+    dist_dir: String,
+    /// 主程序文件名(可选,空 = dist 内唯一 *.exe)
+    #[serde(default)]
+    main_exe: String,
+    /// true = 连 config.json 也覆盖
+    #[serde(default)]
+    overwrite_config: bool,
+    #[serde(default)]
+    token: String,
+    /// ed25519 私钥 hex(可选)
+    #[serde(default)]
+    sign_key: String,
+    /// 轮询确认超时(秒)
+    #[serde(default = "default_timeout")]
+    timeout_secs: u32,
+}
+
+impl Default for AppProfile {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            port: 0,
+            hosts: Vec::new(),
+            dist_dir: String::new(),
+            main_exe: String::new(),
+            overwrite_config: false,
+            token: String::new(),
+            sign_key: String::new(),
+            timeout_secs: default_timeout(),
+        }
+    }
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -180,29 +225,111 @@ async fn cmd_update_host(
     }
 }
 
-fn hosts_file(app: &AppHandle) -> Result<PathBuf, String> {
+fn config_file(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_config_dir()
         .map_err(|e| format!("配置目录不可用: {e}"))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
-    Ok(dir.join("hosts.json"))
+    Ok(dir.join(name))
+}
+
+/// 旧的全局"更新包"设置(仅用于一次性迁移进项目;迁移后删除该文件)
+#[derive(Deserialize, Default)]
+struct LegacySettings {
+    #[serde(default)]
+    dist_dir: String,
+    #[serde(default)]
+    main_exe: String,
+    #[serde(default)]
+    overwrite_config: bool,
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    sign_key: String,
+    #[serde(default)]
+    timeout_secs: u32,
+}
+
+impl LegacySettings {
+    /// 全空则视为没有可迁移的内容
+    fn is_empty(&self) -> bool {
+        self.dist_dir.is_empty()
+            && self.main_exe.is_empty()
+            && !self.overwrite_config
+            && self.token.is_empty()
+            && self.sign_key.is_empty()
+    }
+
+    fn apply_to(&self, a: &mut AppProfile) {
+        a.dist_dir = self.dist_dir.clone();
+        a.main_exe = self.main_exe.clone();
+        a.overwrite_config = self.overwrite_config;
+        a.token = self.token.clone();
+        a.sign_key = self.sign_key.clone();
+        if self.timeout_secs > 0 {
+            a.timeout_secs = self.timeout_secs;
+        }
+    }
+}
+
+/// 读取 apps.json;不存在但旧 hosts.json 存在时,迁移为单档"默认项目"
+fn read_apps(app: &AppHandle) -> Vec<AppProfile> {
+    let Ok(path) = config_file(app, "apps.json") else { return vec![] };
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        if let Ok(apps) = serde_json::from_str::<Vec<AppProfile>>(&s) {
+            return apps;
+        }
+    }
+    // 兼容旧版单列表 hosts.json
+    let Ok(old) = config_file(app, "hosts.json") else { return vec![] };
+    let Ok(s) = std::fs::read_to_string(old) else { return vec![] };
+    let Ok(hosts) = serde_json::from_str::<Vec<HostEntry>>(&s) else { return vec![] };
+    if hosts.is_empty() {
+        return vec![];
+    }
+    vec![AppProfile { name: "默认项目".into(), port: 7600, hosts, ..Default::default() }]
+}
+
+/// 读取项目列表;首启把旧 settings.json 的更新包设置并入项目,随后删除旧文件
+#[tauri::command]
+fn load_apps(app: AppHandle) -> Vec<AppProfile> {
+    let mut apps = read_apps(&app);
+    let Ok(path) = config_file(&app, "settings.json") else { return apps };
+    let Ok(s) = std::fs::read_to_string(&path) else { return apps };
+    let Ok(legacy) = serde_json::from_str::<LegacySettings>(&s) else { return apps };
+    if !legacy.is_empty() {
+        if apps.is_empty() {
+            let mut p = AppProfile { name: "默认项目".into(), port: 7600, ..Default::default() };
+            legacy.apply_to(&mut p);
+            apps.push(p);
+        } else {
+            for a in &mut apps {
+                if a.dist_dir.is_empty() {
+                    legacy.apply_to(a);
+                }
+            }
+        }
+        // 马上落盘,避免"还没保存"期间旧文件被删而丢设置
+        if let Err(e) = write_apps(&app, &apps) {
+            eprintln!("迁移项目配置落盘失败: {e}");
+            return apps;
+        }
+    }
+    // 已逐项并入项目,旧文件不再需要
+    let _ = std::fs::remove_file(&path);
+    apps
+}
+
+fn write_apps(app: &AppHandle, apps: &[AppProfile]) -> Result<(), String> {
+    let path = config_file(app, "apps.json")?;
+    let body = serde_json::to_string_pretty(apps).map_err(|e| e.to_string())?;
+    std::fs::write(path, body).map_err(|e| format!("保存项目配置失败: {e}"))
 }
 
 #[tauri::command]
-fn load_hosts(app: AppHandle) -> Vec<HostEntry> {
-    let Ok(path) = hosts_file(&app) else { return vec![] };
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-#[tauri::command]
-fn save_hosts(app: AppHandle, hosts: Vec<HostEntry>) -> Result<(), String> {
-    let path = hosts_file(&app)?;
-    let body = serde_json::to_string_pretty(&hosts).map_err(|e| e.to_string())?;
-    std::fs::write(path, body).map_err(|e| format!("保存主机列表失败: {e}"))
+fn save_apps(app: AppHandle, apps: Vec<AppProfile>) -> Result<(), String> {
+    write_apps(&app, &apps)
 }
 
 fn main() {
@@ -211,8 +338,8 @@ fn main() {
             cmd_probe,
             cmd_dist_info,
             cmd_update_host,
-            load_hosts,
-            save_hosts
+            load_apps,
+            save_apps
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
