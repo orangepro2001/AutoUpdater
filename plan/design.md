@@ -58,3 +58,154 @@ ghost_updater::start_agent("0.0.0.0:9001", &auth_token);
 | 设计补 | net apply | 重启后宿主丢了原始启动参数(默认端口起服务),推送端轮询旧地址永远失败 | apply 缺省透传本进程原始 argv 作 relaunch_args |
 | e2e | 断言时序 | pusher 见到 restarted=true 时 worker 还没做健康检查后的备份清理 | e2e 轮询等备份目录消失 |
 | gui | src-tauri Cargo.toml | path 依赖 `../ghost-updater-cli` 相对 src-tauri 解析,找不到 | 改 `../../ghost-updater-cli` |
+
+---
+
+## 追加变更:GUI 构建/运行/打包统一入口脚本
+
+### 目标
+
+`cargo run` 在 debug 下走 `tauri.conf.json` 的 `devUrl`(http://localhost:5173),而 `beforeDevCommand`
+只有 `tauri dev` 才会执行;直接 `cargo run` 必然 WebView2 报 ERR_CONNECTION_REFUSED。
+用脚本收敛成一条命令,并把"改前端 / 跑窗口 / 出安装包"三条路径分开。
+
+### 方案取舍
+
+- 脚本落 `tools/gui.ps1`(与既有 `tools/e2e.ps1` 同目录同风格),子命令:
+  - `dev`   → `npm run tauri -- dev`(CLI 自动起 Vite,热更新,走 devUrl 是正确的)
+  - `run`   → `npm run tauri -- build --debug --no-bundle`,再拉起 debug exe。
+            这是"Rust 用 debug、前端用已构建 webdist"的官方 CLI 路径(不走 devUrl)。
+            备选是仓库文档里的 `cargo run --features tauri/custom-protocol`(已核
+            tauri-build-2.7.1/src/lib.rs:591 `is_dev()`:`dev` cfg = tauri 是否未启用
+            `custom-protocol`),功能等价;脚本选 CLI 路径以免与"手动跑"两套说法打架。
+            已实测:窗口正常渲染出界面,无 ERR_CONNECTION_REFUSED。
+  - `build` → `npm run build`(仅 vite → webdist)
+  - `check` → `npm run build` + GUI crate `cargo check`(generate_context! 编译期读 webdist,必须先有)
+  - `installer` → `npm run tauri -- build` → NSIS
+  - `verify` → 主 workspace `cargo build/test` + GUI `check`(复刻 TODO 完成标准)
+- `run` / `installer` 前先 `Stop-Running`:上次运行的 GUI 会锁住 exe,不关掉 cargo 覆盖必报 os error 5。
+- 不改 `tauri.conf.json`:devUrl 是 Tauri 的标准开发配置,问题在调用方式不在配置。
+- `tools/gui.cmd` 薄包装:cmd 下免写 `-ExecutionPolicy Bypass -File`;必须纯 ASCII
+  (cmd 按 GBK 读 .cmd 文件,中文注释会被嚼成命令)。
+
+### 假设
+
+- `npx tauri` / `npm run tauri` 解析到本地 `node_modules/.bin/tauri`(已确认存在);缺 node_modules 时
+  脚本直接 FAIL 并提示 `npm install`,不自动 install(联网副作用不进脚本)。
+- `npm run tauri -- build --debug --no-bundle` 会先跑 `beforeBuildCommand`(npm run build),
+  所以 `run` 无需自己再构建前端。依据:`tauri build --help` 明示会执行 beforeBuildCommand。
+- native 命令的 stderr 在 `$ErrorActionPreference=Stop` 下可能变 terminating error(见既有错误表),
+  故 npm/cargo 一律经 `cmd /c "... 2>&1"` 调用,只看 `$LASTEXITCODE`。
+
+### 错误记录表(追加)
+
+| 时间 | 位置 | 报错/问题 | 处置 |
+|---|---|---|---|
+| 运行 | WebView2 | `cargo run` 后窗口 ERR_CONNECTION_REFUSED(localhost:5173) | debug 走 devUrl 且无人起 Vite;改用脚本 `dev` / `run` |
+| 打包 | cargo 链接 | 上一次运行的推送台进程锁住 debug exe → `failed to remove file ... 拒绝访问 (os error 5)` | `run` / `installer` 前 `Stop-Running`(Stop-Process 同名进程) |
+| 脚本 | tools/gui.cmd | 中文注释被 cmd 按 GBK 解读,注释里的 `\|` 触发分词,报 `'鐢ㄦ硶:' 不是内部或外部命令` | 包装脚本改纯 ASCII(中文只留在带 BOM 的 .ps1 里) |
+
+---
+
+## 追加变更:项目整档保存(更新包设置并入项目)
+
+### 目标
+
+推送台此前只把「应用名 / 默认端口 / 机器列表」存进 apps.json,而「更新包」面板的
+`dist 目录 / 主程序 / 覆盖 config / Token / 签名私钥 / 轮询超时` 是全局单份(settings.json),
+切换应用不跟着换。用户有多个应用各配一套更新包,需要「更新包配置 + 目标主机」整档保存、随项目切换。
+
+### 方案取舍
+
+- 把 6 个更新包字段并入 `AppProfile`(即"项目"):一个项目 = 更新包配置 + 默认端口 + 主机列表,
+  apps.json 成为唯一持久化,不再需要 settings.json。
+- 前端那 6 个输入框由全局变量改为"当前项目的工作副本":切换项目时从 `apps[idx]` 拉取,
+  改动防抖写回该项目。
+- 兼容:`AppProfile` 新字段全部 `#[serde(default)]`(timeout 默认 120);`load_apps` 首启一次性把旧
+  settings.json 的更新包设置补进"还没有 dist 的项目"(无项目则新建"默认项目"),随后删除旧文件。
+- UI 文案「应用」→「项目」;领域上仍是目标机上的一个集成应用,一个应用即一个项目。
+
+### 影响面
+
+- `crates/ghost-updater-tauri/src-tauri/src/main.rs`:AppProfile 扩字段;load_apps 迁移;
+  删 `load_settings`/`save_settings` 命令及 handler 注册;旧 hosts.json 迁移名改「默认项目」。
+- `crates/ghost-updater-tauri/src/App.svelte`:接口扩字段;更新包面板绑定 `active.*`;pull/push 项目;
+  去掉全局 settings 持久化。
+- `README.md` / `HowToUseAutoUpdate.md`:一句带过。
+
+### 假设
+
+- 单级结构:一个项目 = 一个目标应用(一套 exe/端口),不做"项目下再分多个应用"的两级。
+  依据:现有「应用」已是 名称+端口+主机 的单位,用户原话"项目+接受推送的主机"亦为单级组合。
+- 迁移后删除 settings.json 安全:6 项已逐项复制进项目,不丢数据。
+- Token / 签名私钥随项目落 apps.json,与原先落 settings.json 的明文同级别,安全边界不变。
+
+### 错误记录表(追加)
+
+| 时间 | 位置 | 报错/问题 | 处置 |
+|---|---|---|---|
+| 项目保存 | App.svelte | `$: active = apps[activeIdx]` 是派生值,`activeIdx` 同步改后到 reactivity flush 前仍是旧项目;`switchApp` 里紧接着 `refreshDist()` 会预览到上一个项目的 dist | 函数内统一改用 `currentProject() = apps[activeIdx]`,只在模板里用 `active` |
+| 项目保存 | main.rs | `#[derive(Default)]` 的 `timeout_secs` 是 `u32::default()=0`,不是 serde 的 120;Rust 侧新建的"默认项目"轮询超时显示 0 | 手写 `impl Default for AppProfile`,`timeout_secs: default_timeout()` |
+
+---
+
+## 追加变更:Model Copy 三需求(REQ-2 swap 失败回滚 / REQ-3 拒绝路径 drain / REQ-1 多进程编排)
+
+### 目标
+
+落地 plan/feature-requests-from-model-copy.md 三项:swap 半途失败自动回滚并释放 `.apply-lock`;
+stage/apply 拒绝时 drain 请求体让 401 稳定可见;`UpdateConfig.close_processes` 多进程换版编排。
+wire 协议零变化,空配置行为不变。
+
+### 方案取舍
+
+- **REQ-2 回滚不做全量 `restore_backup`,改为"只还原已覆盖的文件"**。原案(备份里没有的
+  当新增删掉)有个数据丢失陷阱:若失败点之后的旧文件没被覆盖、也没进备份(备份段部分失败),
+  restore 会把它们当"本次新增"删除;且 swap 失败时旧文件常仍被外部句柄锁着,restore 的
+  remove+copy 会被 os error 32 卡死。实现:`swap_files` 拆成 `ensure_staged`/`backup_files`/
+  `overwrite_files` 三段(组合壳保持原 API,4 个存量单测不动),`overwrite_files` 失败时仅对
+  已成功覆盖的文件按备份逐个还原、对"备份里没有且刚创建"的删除——只动确实覆盖过的文件,
+  Err 时 install 必已回旧状态,error 文案区分"(已回滚到旧状态)"与"(回滚失败,需人工介入:…)"。
+  备份段失败 = 文件未动,不触发任何还原。`rollback()`/`restore_backup` 保留给健康检查/拉起
+  失败路径(那时文件锁已释放,全量还原安全)。
+- **锁收口**:`run_apply` 拆 parse → inner → `release_lock` 无条件兜底。核验发现泄漏面共 4 条
+  失败路径(pid 超时/swap/健康检查/拉起),需求只点名 2 条,收口一次全覆盖。
+- **REQ-3 drain 只落 stage**。核验:apply 的 `body: String` 是 axum 提取器,handler 执行前
+  body 已读完,天然无此问题;需求里"stage/apply 拒绝"的 apply 半句不成立。stage 的 check_auth
+  拒绝(401/503)与 sha256/main 两个 400 分支都在 body 消费前拒绝,一并 drain(上限
+  MAX_PACKAGE_BYTES,整体 30s 超时防慢速攻击)。
+- **REQ-1 两级编排**:agent 侧(apply 受理、鉴权后)`spawn_blocking(close_processes_graceful)`
+  后再 exit(0)——自退从固定 800ms 变为"800ms + 关闭耗时",worker 的 wait_pid(15s)天然把
+  关闭窗口吃进去;名单经 worker argv `--close a.exe,b.exe` 交接,worker 在等完 `--pid` 后再
+  `wait_processes_exit`(轮询 tasklist,超时 taskkill /F 兜底,镜像 wait_pid_exit 语义)。
+  非 Windows 全部 no-op(REQ 明示可留空)。进程名白名单 `validate_process_names`
+  (仅 `[A-Za-z0-9._-]`)双端校验:routes() 启动 panic(与 pubkey 同风格)+ worker parse,
+  防 taskkill/tasklist 参数注入。
+- **进程操作选 tasklist/taskkill 子进程**(CSV 首列精确比对),不引 Toolhelp32 快照:
+  与既有 wait_pid_exit 的 taskkill 风格一致,零新增 unsafe;GBK 输出里文件名列是 ASCII,
+  utf8_lossy 无损。
+- **close 动作落 apply.log**:core 开 `append_apply_log(install, msg)` pub 口,agent 关闭
+  开始/成功/失败三态都记,排障与 worker 日志同文件。
+
+### 影响面
+
+- core/src/lib.rs:锁收口、swap 三段拆分、close/wait/validate 进程原语、`--close` 参数、单测 +6。
+- net/src/lib.rs:UpdateConfig.close_processes、routes() 校验、drain_body、stage 拒绝分支 drain、
+  apply argv/自退编排、单测 +1(真 TCP)。
+- demo-app:`--close-processes <a.exe,b.exe>` 参数。
+- tools/e2e.ps1:+REQ-2/REQ-3/REQ-1 三场景(见 TODO 核验节)。
+- README/HowToUse:字段、回滚语义、排障表同步;ghost-push/tauri 零改动(推送端属非目标)。
+
+### 假设
+
+- worker 等关联进程超时(10s)按 pid 超时同款处理:放弃更新(文件未动),由 agent 已做过的
+  优雅关闭 + /F 兜底保证实际到不了这一步。
+- 换版后被关进程的自动重启留宿主(需求建议的非目标);Model Copy 计划用"GUI 原在运行"标记。
+- 关联进程名单不进 manifest/不含版本概念,纯粹本机编排参数,故走 argv 不走暂存文件。
+
+### 错误记录表(追加)
+
+| 时间 | 位置 | 报错/问题 | 处置 |
+|---|---|---|---|
+| e2e | REQ-2 断言 | PS5.1 `Get-Content` 按 GBK 读 UTF-8 的 result.json,中文断言全乱码(与早前 BOM 坑同源) | `Get-Content -Raw -Encoding UTF8`;对外输出断言一律改 ASCII 锚点(如 `HTTP status client error` / `error sending request`) |
+| e2e | REQ-1 推送 | dist-v4 含 2 个 exe,ghost-push 拒包"需用 --main 指定" | 推送加 `--main ghost-demo.exe`(既有规则,非 bug) |

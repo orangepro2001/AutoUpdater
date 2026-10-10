@@ -21,12 +21,24 @@ async fn async_main() {
     let token = std::env::args()
         .position(|a| a == "--token")
         .and_then(|i| std::env::args().nth(i + 1));
+    // REQ-1 多进程宿主:apply 受理后需优雅关闭的进程映像名,逗号分隔
+    let close_processes: Vec<String> = std::env::args()
+        .position(|a| a == "--close-processes")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .map(|s| {
+            s.split(',')
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
 
     let app = axum::Router::new()
         .route("/hello", get(|| async { "world" }))
         .merge(ghost_updater_net::routes(ghost_updater_net::UpdateConfig {
             version: app_version(),
             auth_token: token,
+            close_processes,
             ..Default::default()
         }));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();

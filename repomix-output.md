@@ -34,6 +34,9 @@ The content is organized as follows:
 
 # Directory Structure
 ````
+.zcode/
+  plans/
+    plan-sess_91c3196a-360a-4b3e-9e9a-45b719bb5c77.md
 crates/
   demo-app/
     src/
@@ -80,15 +83,603 @@ crates/
     vite.config.ts
 plan/
   design.md
+  feature-requests-from-model-copy.md
   TODO.md
 tools/
   e2e.ps1
+  gui.cmd
+  gui.ps1
 .gitignore
 Cargo.toml
+HowToUseAutoUpdate.md
 README.md
 ````
 
 # Files
+
+## File: .zcode/plans/plan-sess_91c3196a-360a-4b3e-9e9a-45b719bb5c77.md
+````markdown
+# 核验结论（需求 vs 代码，全部属实）
+
+1. **REQ-2 属实**：`core/src/lib.rs:211-216` swap 失败路径确实只 log+write_result+return，不 `restore_backup`、不 `release_lock`。且**核验发现泄漏面比需求说的更大**：健康检查失败路径（:239-245）、拉起失败路径（:247-253）、pid 超时路径（:199-206）共 4 条失败路径全部泄漏 `.apply-lock`。
+2. **REQ-3 属实但范围要修正**：`net/src/lib.rs:136/278` 的 `check_auth` 确实在读 body 前拒绝。但 apply 的 `body: String` 是 axum 提取器，**handler 执行前 body 已被读完**——apply 天然无此问题，需 drain 的只有 **stage**（body 是 `Body`，未消费）。stage 上 `sha256 非法`/`main 非法` 两个 400 分支（:139-144）同样在 body 消费前拒绝，一并修。
+3. **REQ-1 属实**：worker 只等 `--pid`（core:199）；`UpdateConfig`（net:41-52）加字段后，经查全仓库仅 `UpdateConfig::new()`（net:54-58）与 demo-app:27（`..Default::default()`，不破）需同步，cli/tauri 零引用。
+
+# 实施方案
+
+## A. ghost-updater-core（REQ-2 + REQ-1 worker 侧）
+
+**A1. 失败路径统一释放锁**：`run_apply` 拆为 `parse → run_apply_inner(&ApplyArgs) → release_lock(staging)` 无条件兜底，覆盖全部 4 条失败路径（比逐路径补更稳）。
+
+**A2. swap 分两段（关键修正）**：`swap_files` 拆出 `ensure_staged`（预检）+ `backup_files`（备份段）+ `overwrite_files`（覆盖段），`swap_files` 变为三者的组合壳（既有 4 个 swap 单测不动、保持绿）。理由：**备份段失败时文件未动，绝不能调 `restore_backup`**——restore 会把"备份里没有"的现存旧文件当"新增"删掉（数据丢失）；只有覆盖段失败才回滚。`run_apply_inner` 按段处理：
+- 备份段失败 → `msg 含"文件未动"`，log+result+Err（锁由外层释放）；
+- 覆盖段失败 → `rollback()`（复用现有：restore+重拉旧 exe）→ `msg 含"已回滚"`（满足验收）。
+
+**A3. 进程编排原语**（供 net/worker 共用）：
+- `validate_process_names`：仅允许 `[A-Za-z0-9._-]`（防 taskkill /IM 参数注入）；
+- `process_running_by_name`（Windows：`tasklist /FI IMAGENAME eq /FO CSV /NH` 解析首列；非 Windows false）；
+- `close_processes_graceful(names, grace=5s)`（Windows：`taskkill /IM` 无 /F → 轮询 grace → 残留则 `/F` 兜底；非 Windows no-op，按 REQ"非 Windows 可先留空"）；
+- `wait_processes_exit(names, timeout=10s)`（轮询 + 超时 `/F` 兜底，镜像 `wait_pid_exit` 语义；非 Windows true）；
+- `append_apply_log(install, msg)`（把私有 log_line 开个 pub 口，net 关进程动作可落 apply.log）。
+
+**A4. worker 编排**：`parse_apply_args` 增 `--close <a.exe,b.exe>`（逗号分隔，validate）；`run_apply_inner` 在等完 `--pid` 后、备份前：`close` 非空则 `wait_processes_exit`，超时按 pid 超时同款"放弃更新(文件未动)"。
+
+**A5. 单测**（现有 7 个全保绿）：parse `--close`；`validate_process_names` 拒绝空格/引号/斜杠；`process_running_by_name("cmd.exe")` 真假两断言（windows）；`wait_processes_exit` 不存在名快速 true；**swap 失败回滚集成测试**（windows：`OpenOptionsExt::share_mode(1)` 锁住 install 第二个文件 → 覆盖段必败 → 断言 Err 含"已回滚"、install 回旧内容、staging 无 `.apply-lock`、result.json ok:false）。
+
+## B. ghost-updater-net（REQ-3 + REQ-1 agent 侧）
+
+**B1. drain**：新增 `drain_body(body)`（逐帧读到 EOF，上限 `MAX_PACKAGE_BYTES`，整体套 30s 超时防慢速攻击）；stage 的 check_auth 拒绝（401/503）与 sha256/main 两个 400 分支返回前 `drain_body(body).await`。apply 不动（提取器已消费 body）。
+
+**B2. close_processes**：`UpdateConfig` 加 `pub close_processes: Vec<String>`（`new()`/Default 补空）；`routes()` 启动时 `validate_process_names` 非法即 panic（与 pubkey 同风格）；apply handler 构造 worker argv 时（`--` 分隔符前）非空则追加 `--close <csv>`；自退任务改为 `sleep 800ms → spawn_blocking(close_processes_graceful) → exit(0)`，close 动作经 `append_apply_log` 落日志。关进程在 `check_auth` 通过之后，天然满足"错 token 不触发关闭"。
+
+**B3. 单测**（现有 7 个全保绿）：真实 TCP 集成测试——`TcpListener::bind(127.0.0.1:0)` + `axum::serve`，客户端裸 `TcpStream` 发 Content-Length=3MiB + 错 token，边写边等，断言读到 `HTTP/1.1 401`（无 drain 时此测试必挂）；worker argv 含 `--close`。
+
+## C. demo-app
+
+加 `--close-processes <a.exe,b.exe>` 参数（沿用手写 args 扫描风格），传入 `UpdateConfig.close_processes`。
+
+## D. tools/e2e.ps1 扩展三场景（保持 PS5.1/BOM 约定）
+
+- **REQ-2**：装 v2 成功后组 dist-v3(3.0.0)；`[IO.File]::Open(NOTES.txt,'Open','Read','Read')` 锁写不锁读 → 推 v3 → 备份可读、覆盖必败在 NOTES → 断言 ghost-push 退出码≠0、install VERSION 仍 2.0.0、result.json ok:false 含"已回滚"、所有 stage-* 无 `.apply-lock`；释放句柄重推 v3 成功。（注：回滚重拉是无参启动，轮后需 Stop-Process 并手动带参重启，e2e 显式管理）
+- **REQ-3**：dist-v3-big = 拷贝 v3 + `junk.bin` 17MB（.NET WriteAllBytes）；错 token 推 10 次，每次断言输出含 `stage 被拒`+`401` 且**不含** `stage 上传失败`（cli 文案 lib.rs:309/315 恰好可断言）。
+- **REQ-1**：拷 ghost-demo.exe 为 install\demo-gui.exe（v3 字节）并起在 7701（占锁自身 exe）；带 `--close-processes demo-gui.exe` 手动重启主程序；组 dist-v4(4.0.0, 含 demo-gui.exe) 推送 → 断言成功、`Get-Process demo-gui` 无进程（优雅→5s→/F 阶梯全走到）、demo-gui.exe 被换新。
+
+## E. 文档同步
+
+- `plan/TODO.md`：3 项标 done + 核验记录；`plan/design.md`：追加变更小节（阶段化回滚的取舍、drain 范围修正、tasklist/taskkill 选型与名称白名单、非 Windows no-op）+ 错误记录表；`README.md:31-35/52-56` 与 `HowToUseAutoUpdate.md:57-67/158-170`：字段表、回滚行为、排障表同步；`feature-requests-from-model-copy.md` 状态改"已实现"。
+
+## 验证
+
+`cargo build --workspace` → `cargo test --workspace`（存量 14 + 新增 ~10 全绿）→ `tools/e2e.ps1` 全绿。GUI（tauri）不依赖 net/core 新接口且本次零改动，不重跑 gui check。不改 ghost-push（推送端属非目标）。wire 协议零变化（无新路由/头部/参数），零配置默认行为不变。
+````
+
+## File: plan/feature-requests-from-model-copy.md
+````markdown
+# AutoUpdater 需求提案：换版健壮性与多进程宿主支持
+
+| 元信息 | 内容 |
+|---|---|
+| 提出方 | Model Copy（DMT-Model-Copy，AFVI 产线模型复制工具，ghost-updater 下游集成方） |
+| 日期 | 2026-10-10 |
+| 依据 | 本地仓库 commit `33641e5` 源码 + 2026-10-10 真机推送实测（事故与 E2E 日志均在） |
+| 状态 | 已实现（2026-10-10，三项全落地；实施取舍见 plan/design.md 追加变更节。REQ-2 回滚语义比原案更稳：只还原已覆盖文件、不碰未覆盖的旧文件；REQ-3 核验后确认 apply 因 body 提取器先行消费、天然无此问题，drain 只落在 stage） |
+| 涉及 | `ghost-updater-core`（REQ-2）、`ghost-updater-net`（REQ-1 / REQ-3）；wire 协议不变 |
+
+## 0. 摘要
+
+Model Copy 是"GUI + 常驻更新代理"双进程产品，接入 ghost-updater 后在真实推送中踩到
+三个问题：**① swap 半途失败不回滚、不释放锁；② stage/apply 拒绝时不 drain 请求体，
+401 被客户端吞成传输错误；③ 多进程宿主缺少"apply 前关闭其他进程"的编排能力**。
+三项均为增量改动，默认零配置行为不变，不影响 wire 协议。
+
+---
+
+## 1. 背景与事故时间线
+
+Model Copy 安装形态：`model-copy.exe`（Tauri GUI）+ `mcpy.exe`（CLI + 常驻更新代理，
+承载 7600 的 `/update/*` 路由）+ `VERSION`，同目录部署，包内 3 个文件为顶层扁平文件集。
+
+2026-10-10 真机推送（GUI 开着）时间线：
+
+| 时刻 | 事件 |
+|---|---|
+| 11:10:05 | push → stage 成功 → apply 受理，代理应答后 800ms 自退 |
+| 11:10:07 | worker 备份 3 文件后覆盖：VERSION ✓、mcpy.exe ✓、**model-copy.exe ✗（GUI 进程持有文件锁，os error 32）→ swap 半途失败** |
+| 之后 | 代理已退、worker 不拉起任何进程 → 7600 死亡，推送台轮询超时；`.apply-lock` 残留 |
+| 11:20:57 | 修复主程序选项后重推，同样死在 model-copy.exe 覆盖 |
+| 最终 | 宿主侧临时方案（见 REQ-1）落地后 E2E 全过：GUI 被优雅关闭 → 3 文件全换 → 代理自恢复，apply 应答后 ~1s 重启确认 |
+
+---
+
+## 2. 需求详述
+
+### REQ-2（P1）：swap 失败的回滚与锁清理
+
+**问题**：`ghost-updater-core/src/lib.rs` `run_apply()` 中 `swap_files` 的 Err 路径
+（L211-L216）只 `log_line` + `write_result` + `return Err`。后果：
+
+1. 安装目录处于**部分覆盖**状态（files 按序覆盖，失败点之前的已换、之后的没换）；
+2. `.update_backup\backup-<ts>\` 保留但**无人负责还原**；
+3. **`.apply-lock` 泄漏**——锁仅在成功路径释放（L235）；swap 失败与拉起失败两条
+   失败路径都不 `release_lock`，该暂存目录永远 409。
+
+错误信息"文件未动或部分覆盖，见备份"实质是把恢复责任推给人工。
+
+**期望**：swap 失败 → 尽力 `restore_backup`（还原失败要 log"需人工介入"）→
+`release_lock` → `write_result` 标注"已回滚"；与现有"拉起/健康检查失败"路径的回滚
+行为对齐。拉起失败路径顺带补 `release_lock`。
+
+**验收**：
+
+- 锁住安装目录某文件触发 swap 失败 → 安装目录回到一致旧状态；重推同包可成功；
+- 失败后暂存区无 `.apply-lock`；`result.json` `ok:false` 且 error 含"已回滚"。
+
+### REQ-3（P2）：stage/apply 拒绝时 drain 请求体，让 401 可见
+
+**问题**：`ghost-updater-net/src/lib.rs` 中 stage/apply 的 `check_auth` 在读 body
+**之前**拒绝（鉴权前置是正确的安全设计，保留）。但 axum/hyper 对未消费 body 的请求
+发出响应后即关连接：客户端若仍在流式上传大包体（Model Copy 实测 17MB），收到的是
+连接重置，reqwest 报 `error sending request for url (...)` 而**不是 401**。
+客户端恰好写完 body 时又能读到 401——同一配置下错误表现随机，E2E 无法稳定断言，
+真实排障中曾把鉴权问题误判为网络问题。
+
+**期望**：拒绝分支（401/503）在返回前把请求体读完（drain 上限 = `MAX_PACKAGE_BYTES`，
+超限直接断连，此时传输错误可接受）。
+
+**验收**：错 token 推 17MB 包 10 次 → 10 次都是 `stage 被拒: 401`（`error_for_status`
+可见），0 次传输错误；E2E 增加该断言。
+
+### REQ-1（P2）：多进程宿主的换版编排（apply 前关闭目标进程）
+
+**问题**：apply worker 只等待"受理请求的进程"（`--pid`）退出（`wait_pid_exit`）。
+多进程产品的其他常驻进程若持有包内文件，swap 必败（见时间线）。Model Copy 目前以
+宿主侧 axum 中间件规避：`/update/apply` 且 Bearer 校验通过时 `taskkill` GUI 再放行
+（`mc-cli::apply_kill_gui`，已 E2E 验证）。但这套逻辑**每个多进程宿主都要重写一遍**，
+且"多 pid 等待"的本质问题仍在宿主侧无解（worker 不等 GUI 退净，存在关了又没关净的
+窗口期）。
+
+**期望**：`UpdateConfig` 增加可选字段 `close_processes: Vec<String>`（进程映像名列表）：
+
+- apply 受理后、自退前，对列表内进程优雅关闭（Windows：`taskkill` 无 `/F` 即
+  WM_CLOSE → 限时 5s → `/F` 兜底；非 Windows 可先留空实现）；
+- core worker 等待 `--pid` **与列表内全部进程**退出后再 swap；
+- 安全：与鉴权同生命周期（未授权 apply 到不了关闭逻辑）——net 侧实现天然满足，
+  宿主自实现方案无此保证；
+- `close_processes` 为空 = 现状，零配置行为不变。
+
+**非目标（建议）**：换版后被关进程的"自动恢复/重启列表"建议留给宿主（各产品启动
+策略差异大，Model Copy 计划用"GUI 原在运行"标记 + 新代理启动时拉起解决）。
+
+**验收**：双进程产品（GUI 开着）推送 → GUI 优雅关闭 → 全量 swap 成功 → main 自恢复；
+GUI 未运行时推送行为与现状完全一致；错 token 的 apply 不触发任何进程关闭。
+
+---
+
+## 3. 非目标（本批不做）
+
+- 打包子目录支持（顶层扁平边界维持，Model Copy 暂无子目录资源需求）；
+- 推送端（ghost-push / 推送台）改动；
+- 多版本并存、回滚 UI、灰度策略。
+
+## 4. 兼容性与安全
+
+- 三项均为增量：REQ-1 新增可选字段，REQ-2/3 是失败路径行为修正；
+- wire 协议不变（`close_processes` 是服务端本地配置，不新增路由/头部/查询参数）；
+- 现有 14 项协议单测为回归基线，全部应保持绿色。
+
+## 5. 附录：本机实证日志摘录
+
+```text
+# apply.log（swap 失败，两次）
+[1791598207] 文件替换失败: 覆盖 model-copy.exe 失败: 另一个程序正在使用此文件，
+             进程无法访问。 (os error 32)(文件未动或部分覆盖,见备份)
+[1791598858] （同上，重推复现）
+# apply.log（宿主侧 workaround 后，成功）
+[1791599470] 文件替换完成(3 个),备份: ...backup-1791599470
+[1791599472] 更新成功,新进程 pid=25824 存活
+# 推送台侧（REQ-3 症状）
+stage 上传失败: error sending request for url (http://.../update/stage?...)   ← 实为 401
+stage 被拒: HTTP status client error (401 Unauthorized)                       ← 同配置偶发
+```
+
+---
+---
+
+# (EN) Feature Proposal: Apply Robustness & Multi-Process Host Support
+
+| Meta | Content |
+|---|---|
+| Proposed by | Model Copy (DMT-Model-Copy, AFVI production-line model copy tool; ghost-updater downstream integrator) |
+| Date | 2026-10-10 |
+| Basis | Local repo commit `33641e5` + real-machine push tests on 2026-10-10 (incident & E2E logs available) |
+| Status | Draft, pending review |
+| Touches | `ghost-updater-core` (REQ-2), `ghost-updater-net` (REQ-1 / REQ-3); wire protocol unchanged |
+
+## 0. Summary
+
+Model Copy is a dual-process product (GUI + resident update agent). Real-world pushes
+exposed three issues: **① a mid-swap failure performs no rollback and leaks the apply
+lock; ② stage/apply rejections don't drain the request body, so clients see a transport
+error instead of 401; ③ multi-process hosts have no orchestration for closing sibling
+processes before apply**. All three are incremental changes; default zero-config
+behavior is unchanged and the wire protocol is untouched.
+
+## 1. Background & incident timeline
+
+Deployment: `model-copy.exe` (Tauri GUI) + `mcpy.exe` (CLI + resident update agent
+serving `/update/*` on 7600) + `VERSION`, flat 3-file package.
+
+| Time | Event |
+|---|---|
+| 11:10:05 | push → stage OK → apply accepted; agent self-exits 800ms after ack |
+| 11:10:07 | worker backs up 3 files, overwrites: VERSION ✓, mcpy.exe ✓, **model-copy.exe ✗ (locked by running GUI, os error 32) → swap fails midway** |
+| after | agent gone, worker relaunches nothing → 7600 dead, pusher polls till timeout; `.apply-lock` left behind |
+| 11:20:57 | re-push with corrected `main` — same death on model-copy.exe |
+| final | after host-side workaround (see REQ-1) E2E passes: GUI gracefully closed → all 3 files swapped → agent self-recovers, restart confirmed ~1s after apply ack |
+
+## 2. Requirements
+
+### REQ-2 (P1): Rollback & lock cleanup on swap failure
+
+**Problem**: in `ghost-updater-core/src/lib.rs` `run_apply()`, the `swap_files` error
+path (L211-L216) only logs, writes the result, and returns. Consequences:
+
+1. the install dir is left **partially overwritten** (files are copied in order);
+2. `.update_backup\backup-<ts>\` remains with **no one responsible for restoring**;
+3. **`.apply-lock` leaks** — the lock is released only on the success path (L235);
+   neither the swap-failure nor the relaunch-failure path calls `release_lock`, so the
+   staging dir answers 409 forever.
+
+The message "文件未动或部分覆盖，见备份" ("untouched or partially overwritten, see
+backup") effectively hands recovery to a human.
+
+**Expected**: on swap failure → best-effort `restore_backup` (log "manual intervention
+needed" if restore itself fails) → `release_lock` → mark "rolled back" in the result;
+align with the existing relaunch/health-check failure path. Also add `release_lock` to
+the relaunch-failure path.
+
+**Acceptance**:
+
+- Locking a file in the install dir to force a swap failure → install dir returns to a
+  consistent old state; re-pushing the same package succeeds;
+- no `.apply-lock` left after the failure; `result.json` `ok:false` with "rolled back"
+  in the error.
+
+### REQ-3 (P2): Drain request body on stage/apply rejection so 401 is visible
+
+**Problem**: stage/apply `check_auth` rejects **before** reading the body (auth-first
+is the right security design — keep it). But axum/hyper closes the connection after
+responding to a request whose body was never consumed: a client still streaming a large
+body (17 MB in our tests) gets a connection reset and reqwest reports
+`error sending request for url (...)` **instead of 401**. If the client happens to
+finish writing first, it does read the 401 — so under identical configuration the
+failure surfaces randomly, E2E cannot assert it, and a real diagnosis initially
+mistook the auth problem for a network problem.
+
+**Expected**: on the rejection path (401/503), drain the body before responding
+(cap = `MAX_PACKAGE_BYTES`; beyond that, dropping the connection is acceptable).
+
+**Acceptance**: push a 17 MB package with a wrong token 10 times → 10 × `stage rejected:
+401` (visible via `error_for_status`), 0 transport errors; add this assertion to E2E.
+
+### REQ-1 (P2): Multi-process orchestration — close target processes before apply
+
+**Problem**: the apply worker only waits for the process that accepted the request
+(`--pid`, via `wait_pid_exit`). If any other resident process of the product holds a
+packaged file, the swap necessarily fails (see timeline). Model Copy currently works
+around this with a host-side axum middleware: on `/update/apply` with a valid Bearer,
+gracefully kill the GUI before forwarding (`mc-cli::apply_kill_gui`, E2E-verified).
+But **every multi-process host would have to rewrite this**, and the underlying
+"wait for multiple pids" problem remains unsolved on the host side (the worker doesn't
+wait for the GUI to fully exit).
+
+**Expected**: optional `UpdateConfig` field `close_processes: Vec<String>` (image names):
+
+- after apply is accepted and before self-exit, gracefully close listed processes
+  (Windows: `taskkill` without `/F` (WM_CLOSE) → 5 s grace → `/F` fallback;
+  non-Windows may start as a no-op);
+- the worker waits for `--pid` **and all listed processes** to exit before swapping;
+- security: lifecycle-bound to auth (an unauthorized apply never reaches the closing
+  logic) — natural in a net-side implementation, not guaranteed by host-made ones;
+- empty list = current behavior; zero-config unchanged.
+
+**Suggested non-goal**: auto-restarting closed processes after the update is best left
+to hosts (startup policies differ per product; Model Copy plans a "GUI was running"
+marker + relaunch-on-agent-start approach).
+
+**Acceptance**: pushing to a dual-process product with the GUI open → GUI gracefully
+closed → full swap succeeds → `main` self-recovers; with the GUI not running, behavior
+is identical to today; an apply with a wrong token never closes anything.
+
+## 3. Non-goals (this batch)
+
+- subdirectory packaging (flat top-level boundary stays; Model Copy needs none yet);
+- pusher-side changes (ghost-push / console);
+- multi-version coexistence, rollback UI, canary strategies.
+
+## 4. Compatibility & security
+
+- All three are additive: REQ-1 adds an optional field; REQ-2/3 fix failure-path
+  behavior;
+- wire protocol unchanged (`close_processes` is server-local config — no new routes,
+  headers, or query params);
+- the existing 14 protocol unit tests are the regression baseline and must stay green.
+
+## 5. Appendix: log excerpts
+
+```text
+# apply.log (swap failure, twice)
+[1791598207] 文件替换失败: 覆盖 model-copy.exe 失败: ... (os error 32)(文件未动或部分覆盖,见备份)
+[1791598858] (reproduced on re-push)
+# apply.log (after host-side workaround, success)
+[1791599470] 文件替换完成(3 个)
+[1791599472] 更新成功,新进程 pid=25824 存活
+# pusher side (REQ-3 symptom)
+stage 上传失败: error sending request for url (...)   ← actually a 401
+stage 被拒: HTTP status client error (401 Unauthorized) ← same config, intermittent
+```
+
+---
+---
+
+# (한국어) 기능 제안: 적용(apply) 견고성 및 다중 프로세스 호스트 지원
+
+| 메타 | 내용 |
+|---|---|
+| 제안자 | Model Copy (DMT-Model-Copy, AFVI 생산라인 모델 복제 도구, ghost-updater 다운스트림 통합자) |
+| 날짜 | 2026-10-10 |
+| 근거 | 로컬 저장소 commit `33641e5` 및 2026-10-10 실기 푸시 테스트(장애·E2E 로그 보유) |
+| 상태 | 초안, 검토 대기 |
+| 대상 | `ghost-updater-core`(REQ-2), `ghost-updater-net`(REQ-1 / REQ-3), wire 프로토콜 변경 없음 |
+
+## 0. 요약
+
+Model Copy는 GUI + 상주 업데이트 에이전트의 이중 프로세스 제품입니다. 실제 푸시에서
+세 가지 문제가 확인되었습니다. **① swap 도중 실패 시 롤백 없음 및 apply 잠금 누수,
+② stage/apply 거부 시 요청 본문을 drain하지 않아 클라이언트가 401 대신 전송 오류를
+보게 됨, ③ 다중 프로세스 호스트에 apply 전 타 프로세스 종료 오케스트레이션 부재**.
+세 항목 모두 점진적 변경이며, 기본 제로 구성 동작은 불변이고 wire 프로토콜에 영향이
+없습니다.
+
+## 1. 배경 및 장애 타임라인
+
+배포 형태: `model-copy.exe`(Tauri GUI) + `mcpy.exe`(CLI + 상주 업데이트 에이전트,
+7600 포트의 `/update/*` 라우트 담당) + `VERSION`, 동일 디렉터리의 플랫 3파일 패키지.
+
+| 시각 | 이벤트 |
+|---|---|
+| 11:10:05 | push → stage 성공 → apply 수락, 에이전트는 ack 800ms 후 자체 종료 |
+| 11:10:07 | worker가 3파일 백업 후 덮어쓰기: VERSION ✓, mcpy.exe ✓, **model-copy.exe ✗(실행 중 GUI가 파일 잠금, os error 32) → swap 중도 실패** |
+| 이후 | 에이전트 종료, worker는 아무 프로세스도 기동하지 않음 → 7600 사망, 푸셔는 타임아웃까지 폴링, `.apply-lock` 잔존 |
+| 11:20:57 | main 수정 후 재푸시 — model-copy.exe에서 동일하게 실패 |
+| 최종 | 호스트 측 워크어라운드(REQ-1 참조) 적용 후 E2E 통과: GUI 우아하게 종료 → 3파일 전부 교체 → 에이전트 자가 복구, apply ack 후 약 1초에 재시작 확인 |
+
+## 2. 요구사항 상세
+
+### REQ-2 (P1): swap 실패 시 롤백 및 잠금 정리
+
+**문제**: `ghost-updater-core/src/lib.rs`의 `run_apply()`에서 `swap_files` 오류 경로
+(L211-L216)는 로그 기록 + 결과 저장 + 반환만 합니다. 결과:
+
+1. 설치 디렉터리가 **부분 덮어쓰기** 상태로 남음(파일은 순서대로 복사됨);
+2. `.update_backup\backup-<ts>\`가 남지만 **복원을 담당하는 주체가 없음**;
+3. **`.apply-lock` 누수** — 잠금은 성공 경로에서만 해제됨(L235). swap 실패와 기동
+   실패 어느 쪽도 `release_lock`을 호출하지 않아 해당 스테이징 디렉터리는 영원히 409.
+
+"파일 미변경 또는 부분 덮어쓰기, 백업 참조"라는 메시지는 사실상 복구 책임을 사람에게
+넘기는 것입니다.
+
+**기대**: swap 실패 시 → 최선을 다해 `restore_backup`(복원 자체 실패 시 "수동 개입
+필요" 로그) → `release_lock` → 결과에 "롤백됨" 표기. 기존 기동/헬스체크 실패 경로의
+롤백 동작과 정렬. 기동 실패 경로에도 `release_lock` 추가.
+
+**수용 기준**:
+
+- 설치 디렉터리의 파일을 잠가 swap 실패를 유발 → 설치 디렉터리가 일관된 이전 상태로
+  복원, 동일 패키지 재푸시 성공;
+- 실패 후 스테이징에 `.apply-lock` 없음, `result.json` `ok:false` 및 error에
+  "롤백됨" 포함.
+
+### REQ-3 (P2): stage/apply 거부 시 요청 본문 drain으로 401 가시화
+
+**문제**: stage/apply의 `check_auth`는 본문을 읽기 **전에** 거부합니다(인증 우선은
+올바른 보안 설계이므로 유지). 그러나 axum/hyper는 본문이 소비되지 않은 요청에 응답한
+후 연결을 닫습니다. 클라이언트가 대용량 본문(테스트에서 17MB)을 스트리밍 중이면 연결
+리셋을 받고 reqwest는 401이 아닌 `error sending request for url (...)`을 보고합니다.
+클라이언트가 우연히 먼저 쓰기를 끝내면 401을 읽으므로 — 동일한 설정에서 오류 표현이
+무작위로 바뀌어 E2E 단정이 불가능하고, 실제 장애 분석에서 인증 문제를 네트워크 문제로
+오인한 사례가 있었습니다.
+
+**기대**: 거부 경로(401/503)에서는 응답 전에 본문을 끝까지 읽음(drain 상한 =
+`MAX_PACKAGE_BYTES`, 초과 시 연결 끊기 허용).
+
+**수용 기준**: 잘못된 토큰으로 17MB 패키지를 10회 푸시 → 10회 모두 `stage 거부: 401`
+(`error_for_status`로 가시), 전송 오류 0회. E2E에 해당 단언 추가.
+
+### REQ-1 (P2): 다중 프로세스 오케스트레이션 — apply 전 대상 프로세스 종료
+
+**문제**: apply worker는 요청을 수락한 프로세스(`--pid`, `wait_pid_exit`)만 대기합니다.
+제품의 다른 상주 프로세스가 패키지 파일을 잠고 있으면 swap은 반드시 실패합니다(타임라인
+참조). Model Copy는 현재 호스트 측 axum 미들웨어로 회피합니다: 유효한 Bearer와 함께
+`/update/apply`가 오면 전달 전에 GUI를 우아하게 종료(`mc-cli::apply_kill_gui`,
+E2E 검증 완료). 그러나 **모든 다중 프로세스 호스트가 이를 재작성해야 하며**, 근본적인
+"다중 pid 대기" 문제는 호스트 측에서 해결되지 않습니다(worker는 GUI의 완전한 종료를
+기다리지 않음).
+
+**기대**: `UpdateConfig`에 선택 필드 `close_processes: Vec<String>`(프로세스 이미지명
+목록) 추가:
+
+- apply 수락 후 자체 종료 전에 목록의 프로세스를 우아하게 종료(Windows: `/F` 없는
+  `taskkill`(WM_CLOSE) → 5초 유예 → `/F` 폴백, 비 Windows는 우선 no-op 가능);
+- worker는 swap 전에 `--pid` **및 목록의 모든 프로세스** 종료를 대기;
+- 보안: 인증과 수명주기가 동일(미인증 apply는 종료 로직에 도달하지 않음) — net 측
+  구현에서는 자연스럽게 보장되지만 호스트 자체 구현에서는 보장되지 않음;
+- 빈 목록 = 현재 동작, 제로配置 변경 없음.
+
+**권장 비목표**: 업데이트 후 종료된 프로세스의 자동 재시작은 호스트에 맡기는 것이
+좋음(제품별 기동 정책이 다름. Model Copy는 "GUI 실행 중이었음" 마커 + 에이전트 시작 시
+기동 방식으로 계획).
+
+**수용 기준**: GUI가 열린 이중 프로세스 제품에 푸시 → GUI 우아하게 종료 → 전체 swap
+성공 → `main` 자가 복구. GUI가 실행 중이 아닐 때는 오늘날과 동일한 동작. 잘못된 토큰의
+apply는 어떤 프로세스도 종료하지 않음.
+
+## 3. 비목표 (이번 배치)
+
+- 하위 디렉터리 패키징(플랫 최상위 경계 유지, Model Copy는 아직 필요 없음);
+- 푸셔 측 변경(ghost-push / 콘솔);
+- 다중 버전 공존, 롤백 UI, 카나리아 전략.
+
+## 4. 호환성 및 보안
+
+- 세 항목 모두 점진적: REQ-1은 선택 필드 추가, REQ-2/3은 실패 경로 동작 수정;
+- wire 프로토콜 불변(`close_processes`는 서버 로컬 설정 — 새 라우트/헤더/쿼리 파라미터
+  없음);
+- 기존 14개 프로토콜 단위 테스트가 회귀 기준이며 모두 녹색 유지여야 함.
+
+## 5. 부록: 로그 발췌
+
+```text
+# apply.log (swap 실패, 두 번)
+[1791598207] 文件替换失败: 覆盖 model-copy.exe 失败: ... (os error 32)(文件未动或部分覆盖,见备份)
+[1791598858] (재푸시로 재현)
+# apply.log (호스트 측 워크어라운드 후, 성공)
+[1791599470] 文件替换完成(3 个)
+[1791599472] 更新成功,新进程 pid=25824 存活
+# 푸셔 측 (REQ-3 증상)
+stage 上传失败: error sending request for url (...)   ← 실제로는 401
+stage 被拒: HTTP status client error (401 Unauthorized) ← 동일 설정에서 간헐적
+```
+````
+
+## File: tools/gui.cmd
+````batch
+@echo off
+rem Thin wrapper for tools\gui.ps1 so you can skip -ExecutionPolicy Bypass -File.
+rem Usage: tools\gui.cmd dev^|run^|build^|check^|installer^|verify
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0gui.ps1" %*
+exit /b %ERRORLEVEL%
+````
+
+## File: tools/gui.ps1
+````powershell
+# gui.ps1 — ghost-updater 推送台(Tauri GUI)构建 / 运行 / 打包统一入口
+#
+# 为什么需要它:debug 构建下 Tauri 会忽略已构建的 webdist,改让窗口加载
+# tauri.conf.json 的 devUrl(http://localhost:5173),而那个 Vite 开发服务器
+# 只有 `tauri dev` 才会自动拉起。直接 `cargo run` 必然报 ERR_CONNECTION_REFUSED。
+# 所以想跑窗口,要么走 dev(要热更新),要么走 run(用已构建前端,官方路径)。
+#
+# 用法: powershell -ExecutionPolicy Bypass -File tools\gui.ps1 <命令>
+#       或直接用薄包装: tools\gui.cmd <命令>
+$ErrorActionPreference = "Stop"
+
+$Root = Split-Path -Parent $PSScriptRoot              # 仓库根
+$Gui  = Join-Path $Root "crates\ghost-updater-tauri"  # 前端工程(vite/npm 在这里)
+$App  = Join-Path $Gui "src-tauri"                    # Rust 工程
+$Exe  = Join-Path $App "target\debug\ghost-updater-tauri.exe"
+
+function Fail($msg) { Write-Host "[FAIL] $msg" -ForegroundColor Red; exit 1 }
+function Ok($msg)   { Write-Host "[OK]   $msg" -ForegroundColor Green }
+
+function Need-Npm {
+    if (-not (Test-Path (Join-Path $Gui "node_modules"))) {
+        Fail "缺少 node_modules,先执行: cd crates\ghost-updater-tauri; npm install"
+    }
+}
+
+# npm/cargo 的 stderr 在 $ErrorActionPreference=Stop 下可能变 terminating error,
+# 统一经 cmd 调用只看退出码
+function Invoke-Cmd([string]$workDir, [string]$argLine) {
+    Write-Host "> $argLine" -ForegroundColor DarkGray
+    Push-Location $workDir
+    try { cmd /c "$argLine 2>&1"; $code = $LASTEXITCODE } finally { Pop-Location }
+    if ($code -ne 0) { Fail "$argLine 退出码 $code" }
+}
+
+function Build-Frontend { Need-Npm; Invoke-Cmd $Gui "npm run build" }
+
+# 上一次运行的推送台实例会锁住目标 exe,导致 cargo 覆盖时报 os error 5(拒绝访问)
+function Stop-Running {
+    $p = Get-Process ghost-updater-tauri -ErrorAction SilentlyContinue
+    if ($p) {
+        Write-Host "先关闭仍在运行的推送台实例(PID $($p.Id -join ','))" -ForegroundColor Yellow
+        $p | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+# 开发模式:CLI 会先跑 beforeDevCommand(npm run dev)起 Vite,再开窗口,改前端热更新
+function Cmd-Dev {
+    Need-Npm
+    Stop-Running
+    Invoke-Cmd $Gui "npm run tauri -- dev"
+}
+
+# 本地跑一次"打完包的界面":Rust 用 debug 编译,前端用已构建的 webdist(不走 devUrl)
+function Cmd-Run {
+    Need-Npm
+    Stop-Running
+    Invoke-Cmd $Gui "npm run tauri -- build --debug --no-bundle"
+    if (-not (Test-Path $Exe)) { Fail "未找到 $Exe" }
+    Ok "启动 $Exe"
+    & $Exe
+}
+
+# 只重新构建前端 → webdist
+function Cmd-Build {
+    Build-Frontend
+    Ok "webdist 就绪: $(Join-Path $Gui 'webdist')"
+}
+
+# 前端构建 + GUI crate 类型检查(generate_context! 编译期要读 webdist,故不能省前端这步)
+function Cmd-Check {
+    Build-Frontend
+    Invoke-Cmd $App "cargo check"
+    Ok "GUI crate cargo check 通过"
+}
+
+# 正式安装包(NSIS)
+function Cmd-Installer {
+    Need-Npm
+    Stop-Running
+    Invoke-Cmd $Gui "npm run tauri -- build"
+    $dir = Join-Path $App "target\release\bundle\nsis"
+    Ok "安装包输出目录: $dir"
+    Get-ChildItem $dir -Filter *.exe -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "       $($_.Name)" }
+}
+
+# 主 workspace 全量核验 + GUI check
+function Cmd-Verify {
+    Invoke-Cmd $Root "cargo build --workspace"
+    Invoke-Cmd $Root "cargo test --workspace"
+    Cmd-Check
+    Ok "workspace build/test + GUI check 全绿"
+}
+
+function Usage {
+    Write-Host "ghost-updater 推送台(GUI)入口脚本"
+    Write-Host ""
+    Write-Host "  dev        开发模式:起 Vite + 开窗口,前端热更新"
+    Write-Host "  run        跑打包版界面:debug 编译 + 内嵌 webdist(绕过 devUrl)"
+    Write-Host "  build      只构建前端 → webdist"
+    Write-Host "  check      构建前端 + GUI crate cargo check"
+    Write-Host "  installer  正式打包 → NSIS 安装包"
+    Write-Host "  verify     主 workspace build/test + GUI check"
+    Write-Host ""
+    Write-Host "不要直接 cargo run:debug 会去连 devUrl,无人起 Vite 必报连接被拒。"
+}
+
+switch ($args[0]) {
+    "dev"       { Cmd-Dev }
+    "run"       { Cmd-Run }
+    "build"     { Cmd-Build }
+    "check"     { Cmd-Check }
+    "installer" { Cmd-Installer }
+    "verify"    { Cmd-Verify }
+    default     { Usage; if ($args[0]) { exit 1 } }
+}
+````
 
 ## File: crates/demo-app/src/main.rs
 ````rust
@@ -115,12 +706,24 @@ async fn async_main() {
     let token = std::env::args()
         .position(|a| a == "--token")
         .and_then(|i| std::env::args().nth(i + 1));
+    // REQ-1 多进程宿主:apply 受理后需优雅关闭的进程映像名,逗号分隔
+    let close_processes: Vec<String> = std::env::args()
+        .position(|a| a == "--close-processes")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .map(|s| {
+            s.split(',')
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
 
     let app = axum::Router::new()
         .route("/hello", get(|| async { "world" }))
         .merge(ghost_updater_net::routes(ghost_updater_net::UpdateConfig {
             version: app_version(),
             auth_token: token,
+            close_processes,
             ..Default::default()
         }));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -822,14 +1425,17 @@ tokio-util = { workspace = true }
 //! 否则立即返回,走正常业务逻辑。
 //!
 //! apply worker 流程(全程阻塞 std,必须在 tokio runtime 建立前执行):
-//!   1. 解析 --pid/--install/--staging(/--from),读暂存区 manifest.json
+//!   1. 解析 --pid/--install/--staging(/--from/--close),读暂存区 manifest.json
 //!   2. 等旧进程(pid)退出:轮询 process_alive,超时 taskkill /F 兜底
+//!   2.5 等 --close 列出的关联进程退出(多进程宿主:agent 侧已优雅关闭,这里兜底等待/强杀)
 //!   3. 备份安装目录将被覆盖的文件 → <install>/.update_backup/backup-<ts>/
-//!   4. 用暂存文件覆盖安装目录(整体预校验后再动,保留未列入清单的配置文件)
+//!   4. 用暂存文件覆盖安装目录(整体预校验后再动,保留未列入清单的配置文件;
+//!      覆盖段中途失败当场按备份逐文件还原,Err 时 install 已回到旧状态)
 //!   5. 分离拉起安装目录的新 exe(DETACHED|CREATE_NO_WINDOW,stdio 直弃,
 //!      严禁管道捕获 —— 孙进程继承管道写句柄会导致等 EOF 永久卡死),1.5s
 //!      存活判定为健康
-//!   6. 失败回滚:还原备份、删本次新增文件、重拉旧 exe;apply.log/result.json 记录全程
+//!   6. 失败回滚:还原备份、删本次新增文件、重拉旧 exe;apply.log/result.json 记录全程;
+//!      所有失败路径(含备份/覆盖段)统一由 run_apply 收口释放 .apply-lock
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -925,6 +1531,123 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// 进程映像名白名单:只允许 ASCII 字母数字与 `. _ -`,杜绝 taskkill/tasklist 参数注入。
+pub fn validate_process_names(names: &[String]) -> Result<(), String> {
+    for n in names {
+        if n.is_empty()
+            || !n
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        {
+            return Err(format!("进程名只允许字母数字与 ._-: {n:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// 进程映像名是否在运行。Windows: tasklist CSV 首列精确比对(GBK 输出里文件名段
+/// 是 ASCII,utf8_lossy 不损伤);非 Windows 恒 false(close/wait 均为 no-op)。
+pub fn process_running_by_name(name: &str) -> bool {
+    #[cfg(windows)]
+    {
+        let Ok(out) = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("IMAGENAME eq {name}"), "/FO", "CSV", "/NH"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            return false;
+        };
+        String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+            let first = line.split(',').next().unwrap_or("").trim_matches('"');
+            first.eq_ignore_ascii_case(name)
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = name;
+        false
+    }
+}
+
+fn taskkill_image(name: &str, force: bool) {
+    let mut args = vec!["/IM".to_string(), name.to_string()];
+    if force {
+        args.push("/F".to_string());
+    }
+    let _ = std::process::Command::new("taskkill")
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// 优雅关闭一批进程(REQ-1):Windows 先 `taskkill /IM`(无 /F = WM_CLOSE),
+/// grace 内轮询,残留再 `/F` 兜底。Err = 仍有进程关不掉(需人工介入)。
+/// 非 Windows no-op(REQ:可先留空实现)。
+pub fn close_processes_graceful(names: &[String], grace: Duration) -> Result<(), String> {
+    validate_process_names(names)?;
+    #[cfg(windows)]
+    {
+        let mut stubborn = Vec::new();
+        for n in names {
+            taskkill_image(n, false);
+            let deadline = std::time::Instant::now() + grace;
+            while process_running_by_name(n) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            if process_running_by_name(n) {
+                taskkill_image(n, true);
+                std::thread::sleep(Duration::from_millis(500));
+                if process_running_by_name(n) {
+                    stubborn.push(n.clone());
+                }
+            }
+        }
+        if stubborn.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("以下进程未能关闭: {}", stubborn.join(", ")))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (names, grace);
+        Ok(())
+    }
+}
+
+/// 等待一批进程映像名全部退出:轮询,超时逐个 taskkill /F 兜底(镜像 wait_pid_exit 语义)。
+/// 名单非法视为配置错误,返回 false(放弃更新)。非 Windows 恒 true(与 no-op close 配套)。
+pub fn wait_processes_exit(names: &[String], timeout: Duration) -> bool {
+    if validate_process_names(names).is_err() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if names.iter().all(|n| !process_running_by_name(n)) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        for n in names {
+            taskkill_image(n, true);
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        names.iter().all(|n| !process_running_by_name(n))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (names, timeout);
+        true
+    }
+}
+
 /// main 顶部拦截:检测 `--internal-apply-update`,是 apply worker 就地完成换版并 exit,
 /// 永不返回;否则直接 return,宿主继续正常启动。
 pub fn guard_apply_update() {
@@ -955,6 +1678,8 @@ struct ApplyArgs {
     install: PathBuf,
     staging: PathBuf,
     from_version: String,
+    /// 需一并等待退出的关联进程映像名(net 侧 --close 传入;agent 已做过优雅关闭)
+    close: Vec<String>,
 }
 
 fn parse_apply_args(argv: &[String]) -> Result<ApplyArgs, String> {
@@ -962,6 +1687,7 @@ fn parse_apply_args(argv: &[String]) -> Result<ApplyArgs, String> {
     let mut install = None;
     let mut staging = None;
     let mut from = String::new();
+    let mut close = Vec::new();
     let mut i = 0;
     while i < argv.len() {
         let val = |i: usize| argv.get(i + 1).ok_or_else(|| format!("{} 缺值", argv[i]));
@@ -970,6 +1696,14 @@ fn parse_apply_args(argv: &[String]) -> Result<ApplyArgs, String> {
             "--install" => install = Some(PathBuf::from(val(i)?)),
             "--staging" => staging = Some(PathBuf::from(val(i)?)),
             "--from" => from = val(i)?.clone(),
+            "--close" => {
+                close = val(i)?
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                validate_process_names(&close)?;
+            }
             other => return Err(format!("未知参数: {other}")),
         }
         i += 2;
@@ -979,11 +1713,19 @@ fn parse_apply_args(argv: &[String]) -> Result<ApplyArgs, String> {
         install: install.ok_or("缺少 --install")?,
         staging: staging.ok_or("缺少 --staging")?,
         from_version: from,
+        close,
     })
 }
 
 fn run_apply(argv: &[String], relaunch_args: &[String]) -> Result<(), String> {
     let a = parse_apply_args(argv)?;
+    let r = run_apply_inner(&a, relaunch_args);
+    // 锁收口:成功/任何失败路径统一在这里释放,失败不再泄漏 .apply-lock(REQ-2)
+    release_lock(&a.staging);
+    r
+}
+
+fn run_apply_inner(a: &ApplyArgs, relaunch_args: &[String]) -> Result<(), String> {
     let update_dir = a.install.join(UPDATE_DIR_NAME);
     std::fs::create_dir_all(&update_dir)
         .map_err(|e| format!("创建 {} 失败: {e}", update_dir.display()))?;
@@ -1022,11 +1764,36 @@ fn run_apply(argv: &[String], relaunch_args: &[String]) -> Result<(), String> {
     }
     std::thread::sleep(Duration::from_millis(300)); // 句柄释放缓冲
 
-    // 2+3. 备份 + 覆盖
+    // 1.5 等关联进程退出(REQ-1 多进程宿主:agent 侧已优雅关闭,这里兜底等待 + taskkill /F)
+    if !a.close.is_empty() {
+        if !wait_processes_exit(&a.close, Duration::from_secs(10)) {
+            let msg = format!(
+                "关联进程({}) 10s 内未退出,放弃更新(文件未动)",
+                a.close.join(",")
+            );
+            log_line(&log_path, &msg);
+            write_result(&update_dir, false, &a.from_version, &manifest.files, &msg);
+            return Err(msg);
+        }
+    }
+
+    // 2+3. 备份 + 覆盖(分段:备份段失败文件未动;覆盖段失败由 overwrite_files 当场还原,
+    //      只还原已覆盖的文件 —— 不碰未覆盖的旧文件,避免 remove 旧文件被外部句柄锁卡死)
     let backup_dir = update_dir.join(format!("backup-{}", unix_secs()));
-    if let Err(e) = swap_files(&a.install, &a.staging, &manifest.files, &backup_dir) {
-        let msg = format!("文件替换失败: {e}(文件未动或部分覆盖,见备份)");
+    if let Err(e) = ensure_staged(&a.staging, &manifest.files)
+        .and_then(|_| backup_files(&a.install, &manifest.files, &backup_dir))
+    {
+        let msg = format!("暂存/备份失败: {e}(文件未动)");
         log_line(&log_path, &msg);
+        write_result(&update_dir, false, &a.from_version, &manifest.files, &msg);
+        return Err(msg);
+    }
+    if let Err(e) = overwrite_files(&a.install, &a.staging, &manifest.files, &backup_dir) {
+        log_line(&log_path, &format!("文件替换失败: {e};重拉旧版恢复服务"));
+        if !manifest.main.is_empty() {
+            let _ = start_detached(&a.install.join(&manifest.main), &a.install, &[], None);
+        }
+        let msg = format!("文件替换失败: {e}");
         write_result(&update_dir, false, &a.from_version, &manifest.files, &msg);
         return Err(msg);
     }
@@ -1048,7 +1815,6 @@ fn run_apply(argv: &[String], relaunch_args: &[String]) -> Result<(), String> {
             std::thread::sleep(Duration::from_millis(1500));
             if child_still_alive(&mut child) {
                 let _ = std::fs::remove_dir_all(&backup_dir); // 成功清备份
-                release_lock(&a.staging);
                 log_line(&log_path, &format!("更新成功,新进程 pid={} 存活", child.id()));
                 write_result(&update_dir, true, &a.from_version, &manifest.files, "");
                 Ok(())
@@ -1083,15 +1849,20 @@ fn rollback(install: &Path, backup_dir: &Path, files: &[String], main: &str, log
     }
 }
 
-/// 备份 + 覆盖:先整体校验暂存源齐全且文件名扁平,再备份安装目录现存文件,最后覆盖。
-/// 返回后 install = 暂存内容;未列入 files 的既有文件(如 config.json)不动。
-pub fn swap_files(install: &Path, staging: &Path, files: &[String], backup_dir: &Path) -> Result<(), String> {
+/// 暂存区预检:文件名扁平 + 源文件齐全。失败 = 安装目录保证未动。
+fn ensure_staged(staging: &Path, files: &[String]) -> Result<(), String> {
     validate_file_names(files)?;
     for f in files {
         if !staging.join(f).is_file() {
             return Err(format!("暂存区缺少文件: {}", staging.join(f).display()));
         }
     }
+    Ok(())
+}
+
+/// 备份安装目录现存文件(不覆盖;失败时 install 未动过)。
+pub fn backup_files(install: &Path, files: &[String], backup_dir: &Path) -> Result<(), String> {
+    validate_file_names(files)?;
     std::fs::create_dir_all(backup_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
     for f in files {
         let dst = install.join(f);
@@ -1099,10 +1870,55 @@ pub fn swap_files(install: &Path, staging: &Path, files: &[String], backup_dir: 
             std::fs::copy(&dst, backup_dir.join(f)).map_err(|e| format!("备份 {f} 失败: {e}"))?;
         }
     }
+    Ok(())
+}
+
+/// 用暂存文件覆盖安装目录(调用前必须已 backup_files)。
+/// 覆盖段中途失败:已覆盖的文件当场按备份逐个还原、本次新增(备份里没有的)删除,
+/// 返回 Err 时 install 已回到旧状态 —— 只动确实覆盖过的文件,未覆盖的旧文件
+/// (可能仍被外部句柄锁着)绝不 remove,所以还原不会被锁卡死。
+pub fn overwrite_files(
+    install: &Path,
+    staging: &Path,
+    files: &[String],
+    backup_dir: &Path,
+) -> Result<(), String> {
+    validate_file_names(files)?;
+    let mut done: Vec<&String> = Vec::new();
     for f in files {
-        std::fs::copy(staging.join(f), install.join(f)).map_err(|e| format!("覆盖 {f} 失败: {e}"))?;
+        match std::fs::copy(staging.join(f), install.join(f)) {
+            Ok(_) => done.push(f),
+            Err(e) => {
+                let mut bad: Vec<String> = Vec::new();
+                for f2 in done {
+                    let bak = backup_dir.join(f2);
+                    let r = if bak.is_file() {
+                        std::fs::copy(&bak, install.join(f2)).map(|_| ())
+                    } else {
+                        std::fs::remove_file(install.join(f2)) // 本次新增的,删掉
+                    };
+                    if let Err(e2) = r {
+                        bad.push(format!("还原 {f2}: {e2}"));
+                    }
+                }
+                return Err(if bad.is_empty() {
+                    format!("覆盖 {f} 失败: {e}(已回滚到旧状态)")
+                } else {
+                    format!("覆盖 {f} 失败: {e}(回滚失败,需人工介入: {})", bad.join("; "))
+                });
+            }
+        }
     }
     Ok(())
+}
+
+/// 备份 + 覆盖:先整体校验暂存源齐全且文件名扁平,再备份安装目录现存文件,最后覆盖。
+/// 返回后 install = 暂存内容;未列入 files 的既有文件(如 config.json)不动。
+/// 覆盖段失败的还原语义见 overwrite_files(Err 时 install 已回旧状态)。
+pub fn swap_files(install: &Path, staging: &Path, files: &[String], backup_dir: &Path) -> Result<(), String> {
+    ensure_staged(staging, files)?;
+    backup_files(install, files, backup_dir)?;
+    overwrite_files(install, staging, files, backup_dir)
 }
 
 /// 回滚:备份里有的恢复原样;备份里没有的(本次新增)删除。
@@ -1199,6 +2015,13 @@ fn log_line(path: &Path, msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "[{}] {}", unix_secs(), msg);
     }
+}
+
+/// 宿主侧(agent)向 apply.log 追记一行(如 close_processes 关闭动作),与 worker 日志同文件。
+pub fn append_apply_log(install: &Path, msg: &str) {
+    let dir = install.join(UPDATE_DIR_NAME);
+    let _ = std::fs::create_dir_all(&dir);
+    log_line(&dir.join("apply.log"), msg);
 }
 
 fn write_result(update_dir: &Path, ok: bool, from: &str, files: &[String], error: &str) {
@@ -1353,6 +2176,103 @@ mod tests {
         assert!(split_at_flag(&["--foo".to_string()]).is_none());
     }
 
+    #[test]
+    fn parse_close_processes_arg() {
+        let args: Vec<String> = ["--install", "I", "--staging", "S", "--close", "gui.exe, helper.exe ,"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let a = parse_apply_args(&args).unwrap();
+        assert_eq!(a.close, vec!["gui.exe".to_string(), "helper.exe".to_string()]);
+        assert!(parse_apply_args(&["--close".to_string(), "a b.exe".to_string()]).is_err());
+    }
+
+    #[test]
+    fn process_names_whitelist_rejects_injection() {
+        validate_process_names(&["demo-gui.exe".into(), "My_App-2.exe".into()]).unwrap();
+        for bad in ["a b.exe", "a\"b", "a/b", "a\\b", "a;b", "", "a|b"] {
+            assert!(validate_process_names(&[bad.to_string()]).is_err(), "{bad}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_running_by_name_detects_cmd_child() {
+        let _c = dummy_child(5);
+        assert!(process_running_by_name("cmd.exe"));
+        assert!(!process_running_by_name("ghost-updater-no-such-proc.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wait_processes_exit_fast_for_absent_name() {
+        let t = std::time::Instant::now();
+        assert!(wait_processes_exit(&["ghost-updater-no-such-proc.exe".into()], Duration::from_secs(5)));
+        assert!(t.elapsed() < Duration::from_secs(2), "不存在名不应等到超时");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn close_processes_graceful_ok_for_absent_name() {
+        assert!(close_processes_graceful(
+            &["ghost-updater-no-such-proc.exe".into()],
+            Duration::from_millis(500)
+        )
+        .is_ok());
+    }
+
+    /// REQ-2 验收:锁住安装目录文件逼停覆盖段 → Err 含"已回滚"、install 回旧状态、
+    /// 暂存区无 .apply-lock、result.json ok:false。share_mode(1)=FILE_SHARE_READ:
+    /// 备份可读、覆盖写必败(os error 32),正好落在覆盖段失败分支。
+    #[cfg(windows)]
+    #[test]
+    fn swap_failure_rolls_back_and_releases_lock() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let install = temp_dir("roll-install");
+        let staging = temp_dir("roll-staging");
+        put(&install, "app.txt", b"old-app");
+        put(&install, "locked.bin", b"old-locked");
+        put(&staging, "app.txt", b"new-app");
+        put(&staging, "locked.bin", b"new-locked");
+        std::fs::write(
+            staging.join("manifest.json"),
+            serde_json::to_string(&StageManifest {
+                files: vec!["app.txt".into(), "locked.bin".into()],
+                sha256: "0".into(),
+                main: "app.txt".into(), // 非 exe,回滚重拉会静默失败,单测无副作用
+                staged_at: 0,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        acquire_apply_lock(&staging).unwrap();
+
+        let _guard = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ:他人可读不可写
+            .open(install.join("locked.bin"))
+            .unwrap();
+
+        let argv: Vec<String> = [
+            "--install",
+            install.to_str().unwrap(),
+            "--staging",
+            staging.to_str().unwrap(),
+            "--from",
+            "1.0.0",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let err = run_apply(&argv, &[]).unwrap_err();
+        assert!(err.contains("已回滚"), "err={err}");
+        assert_eq!(get(&install, "app.txt"), b"old-app"); // 已覆盖的被还原
+        assert_eq!(get(&install, "locked.bin"), b"old-locked"); // 未覆盖的原样
+        assert!(!staging.join(APPLY_LOCK_NAME).exists()); // 锁已释放,可重推
+        let result = std::fs::read_to_string(install.join(UPDATE_DIR_NAME).join("result.json")).unwrap();
+        assert!(result.contains("\"ok\":false") && result.contains("已回滚"), "result={result}");
+    }
+
     fn dummy_child(sleep_secs: u32) -> std::process::Child {
         #[cfg(windows)]
         let mut cmd = {
@@ -1445,11 +2365,21 @@ pub struct UpdateConfig {
     pub install_dir: Option<PathBuf>,
     /// 暂存根目录(默认 cwd 相对 .ghost-update/)
     pub staging_root: Option<PathBuf>,
+    /// apply 受理后需优雅关闭的本机进程映像名(REQ-1 多进程宿主编排;空 = 现状零改动)。
+    /// agent 关闭 → 自退;worker 会再兜底等待名单内进程全部退出才动文件。
+    pub close_processes: Vec<String>,
 }
 
 impl UpdateConfig {
     pub fn new(version: impl Into<String>) -> Self {
-        Self { version: version.into(), auth_token: None, pubkey_hex: None, install_dir: None, staging_root: None }
+        Self {
+            version: version.into(),
+            auth_token: None,
+            pubkey_hex: None,
+            install_dir: None,
+            staging_root: None,
+            close_processes: Vec::new(),
+        }
     }
 }
 
@@ -1477,6 +2407,9 @@ pub fn routes(cfg: UpdateConfig) -> Router {
         None => (None, String::new()),
     };
     let staging_root = cfg.staging_root.clone().unwrap_or_else(|| PathBuf::from(STAGING_ROOT));
+    if let Err(e) = ghost_updater_core::validate_process_names(&cfg.close_processes) {
+        panic!("close_processes 非法: {e}");
+    }
     Router::new()
         .route("/update/probe", get(probe))
         .route("/update/stage", post(stage))
@@ -1530,12 +2463,15 @@ async fn stage(
     body: Body,
 ) -> Response {
     if let Err(r) = check_auth(&st, &headers) {
+        drain_body(body).await;
         return r;
     }
     if q.sha256.len() != 64 || hex::decode(&q.sha256).is_err() {
+        drain_body(body).await;
         return err(StatusCode::BAD_REQUEST, "sha256 必须是 64 位 hex");
     }
     if let Err(e) = ghost_updater_core::validate_file_names(std::slice::from_ref(&q.main)) {
+        drain_body(body).await;
         return err(StatusCode::BAD_REQUEST, &format!("main 非法: {e}"));
     }
 
@@ -1636,6 +2572,31 @@ async fn stream_to_file(body: Body, path: &Path, hasher: &mut Sha256) -> Result<
     Ok(total)
 }
 
+/// 把未消费的请求体读完再响应(REQ-3):axum/hyper 对未读 body 的请求发完响应即断连,
+/// 客户端若仍在流式上传大包体,看到的是连接重置而非 401/4xx,错误表现随机、E2E 无法断言。
+/// 上限 MAX_PACKAGE_BYTES(超限放弃、断连可接受),整体 30s 超时不伺候慢速攻击。
+async fn drain_body(body: Body) {
+    use http_body_util::BodyExt;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+        let mut body = body;
+        let mut total: u64 = 0;
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(f) => {
+                    if let Some(d) = f.data_ref() {
+                        total += d.len() as u64;
+                    }
+                    if total > MAX_PACKAGE_BYTES {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+    .await;
+}
+
 /// 解包 tar 到 dir,只接受扁平普通文件;返回文件名列表。
 fn unpack_flat(pkg: &Path, dir: &Path) -> Result<Vec<String>, String> {
     let mut ar = tar::Archive::new(std::fs::File::open(pkg).map_err(|e| format!("开包: {e}"))?);
@@ -1720,6 +2681,11 @@ async fn apply(State(st): State<UpdateState>, headers: HeaderMap, body: String) 
         "--from".into(),
         st.cfg.version.clone(),
     ];
+    // REQ-1:worker 要等这些关联进程退出后才动文件,名单经 argv 交接
+    if !st.cfg.close_processes.is_empty() {
+        argv.push("--close".into());
+        argv.push(st.cfg.close_processes.join(","));
+    }
     if !relaunch_args.is_empty() {
         argv.push("--".into());
         argv.extend(relaunch_args);
@@ -1729,9 +2695,30 @@ async fn apply(State(st): State<UpdateState>, headers: HeaderMap, body: String) 
         return err(StatusCode::INTERNAL_SERVER_ERROR, &format!("拉起 apply worker 失败: {e}"));
     }
 
-    // ack 已代表受理;留出响应回程时间后自退,接力棒交给暂存区里的新 exe
-    tokio::spawn(async {
+    // ack 已代表受理;留出响应回程时间后:优雅关闭 close_processes → 自退,
+    // 接力棒交给暂存区里的新 exe(worker 会等 --pid 即本进程退出)
+    let install_for_log = install.clone();
+    let close_list = st.cfg.close_processes.clone();
+    tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        if !close_list.is_empty() {
+            ghost_updater_core::append_apply_log(
+                &install_for_log,
+                &format!("apply 受理,优雅关闭关联进程: {}", close_list.join(", ")),
+            );
+            let closed = tokio::task::spawn_blocking(move || {
+                ghost_updater_core::close_processes_graceful(&close_list, std::time::Duration::from_secs(5))
+            })
+            .await;
+            match closed {
+                Ok(Ok(())) => ghost_updater_core::append_apply_log(&install_for_log, "关联进程已全部关闭,代理自退"),
+                Ok(Err(e)) => ghost_updater_core::append_apply_log(
+                    &install_for_log,
+                    &format!("关联进程关闭失败: {e}(代理自退,worker 会兜底等待/强杀)"),
+                ),
+                Err(e) => ghost_updater_core::append_apply_log(&install_for_log, &format!("关闭任务异常: {e}")),
+            }
+        }
         std::process::exit(0);
     });
     Json(json!({ "ok": true, "staging": staging_dir_name(&staging_abs), "pid": std::process::id() }))
@@ -1921,6 +2908,34 @@ mod tests {
         assert_eq!(code, StatusCode::UNAUTHORIZED);
     }
 
+    /// REQ-3 验收:拒绝路径必须把请求体 drain 完再回 401,否则 hyper 对未消费 body
+    /// 的请求发完响应即断连,仍在流式上传的客户端只会看到连接重置。真实 TCP 全双工验证
+    /// (内存 oneshot 测不出连接行为):客户端边写 3MiB 边等,无 drain 时写/读必炸一个。
+    #[tokio::test]
+    async fn stage_wrong_token_big_body_still_401_over_tcp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (app, _root) = app_with(UpdateConfig { auth_token: Some("t".into()), ..UpdateConfig::new("1.0.0") }, "drain401");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = "POST /update/stage?sha256=ab&main=a.exe HTTP/1.1\r\n\
+                    Host: e2e\r\nAuthorization: Bearer wrong\r\nContent-Length: 3145728\r\n\
+                    Connection: close\r\n\r\n";
+        s.write_all(head.as_bytes()).await.unwrap();
+        let chunk = vec![0u8; 65536];
+        for _ in 0..48 {
+            s.write_all(&chunk).await.unwrap();
+        }
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf).await;
+        let head_str = String::from_utf8_lossy(&buf[..buf.len().min(2048)]).to_string();
+        assert!(head_str.starts_with("HTTP/1.1 401"), "应读到 401,实际: {head_str}");
+    }
+
     #[tokio::test]
     async fn stage_sha_mismatch_rejects_and_cleans() {
         let (app, root) = app_with(UpdateConfig { auth_token: Some("t".into()), ..UpdateConfig::new("1.0.0") }, "shabad");
@@ -2051,7 +3066,7 @@ h2 { font-size: 13px; margin: 0 0 8px; color: var(--dim); font-weight: 600; lett
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .grow { flex: 1; }
 
-input[type="text"], input[type="password"] {
+input[type="text"], input[type="password"], select, textarea {
   background: var(--panel2);
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -2059,8 +3074,10 @@ input[type="text"], input[type="password"] {
   padding: 6px 9px;
   outline: none;
   min-width: 0;
+  font: inherit;
 }
-input:focus { border-color: var(--acc); }
+textarea { resize: vertical; font-family: Consolas, "Cascadia Mono", monospace; }
+input:focus, select:focus, textarea:focus { border-color: var(--acc); }
 
 button {
   background: var(--panel2);
@@ -2118,6 +3135,12 @@ tr:hover td { background: rgba(79, 156, 249, 0.05); }
   import { onMount } from "svelte";
 
   interface HostEntry { addr: string }
+  // 一个项目 = 更新包配置 + 默认端口 + 目标主机列表,整档保存(apps.json)
+  interface AppProfile {
+    name: string; port: number; hosts: HostEntry[];
+    dist_dir: string; main_exe: string; overwrite_config: boolean;
+    token: string; sign_key: string; timeout_secs: number;
+  }
   interface ProbeResult {
     addr: string; reachable: boolean; version: string; started_at: number;
     os: string; arch: string; pubkey_fingerprint: string; error: string;
@@ -2142,19 +3165,36 @@ tr:hover td { background: rgba(79, 156, 249, 0.05); }
   }
   interface LogLine { addr: string; line: string }
 
-  // ---- 更新包配置 ----
-  let distDir = "";
-  let mainExe = "";
-  let overwriteConfig = false;
-  let token = "";
-  let signKey = "";
-  let timeoutSecs = 120;
+  // ---- 更新包配置直接读写当前项目(apps[activeIdx]),切换项目即随档切换 ----
   let dist: DistInfo | null = null;
   let distError = "";
 
-  // ---- 主机 ----
+  // ---- 项目配置(每套 = 更新包设置 + 项目名 + 默认端口 + 机器列表) ----
+  function blankProject(name: string, port = 7600): AppProfile {
+    return {
+      name, port, hosts: [],
+      dist_dir: "", main_exe: "", overwrite_config: false,
+      token: "", sign_key: "", timeout_secs: 120,
+    };
+  }
+  let apps: AppProfile[] = [blankProject("项目A")];
+  let activeIdx = 0;
+  $: active = apps[activeIdx];
+  // 函数内一律用 currentProject():active 是 $: 派生,同步改 activeIdx 后尚未刷新,
+  // switchApp 里紧接着读 active 会拿到上一个项目。
+  const currentProject = (): AppProfile | undefined => apps[activeIdx];
+
+  // ---- 当前应用的主机工作列表 ----
   let hosts: HostState[] = [];
-  let newAddr = "";
+  let newIp = "";
+  let newPort = 7600;
+  let batchOpen = false;
+  let batchText = "";
+  let importFrom = "";
+  let addingApp = false;
+  let newName = "";
+  let renaming = false;
+  let renameText = "";
   let logs: { addr: string; line: string; at: string }[] = [];
   let pushing = false;
   let logEl: HTMLElement;
@@ -2179,10 +3219,9 @@ tr:hover td { background: rgba(79, 156, 249, 0.05); }
     return hosts.find((h) => h.addr === addr);
   }
 
-  // ---- 主机列表持久化 ----
-  async function loadHosts() {
-    const saved = await invoke<HostEntry[]>("load_hosts");
-    hosts = saved.map((e) => freshHost(e.addr));
+  function pushLog(addr: string, line: string) {
+    logs = [...logs.slice(-500), { addr, line, at: now() }];
+    if (logEl) logEl.scrollTop = logEl.scrollHeight;
   }
 
   function freshHost(addr: string): HostState {
@@ -2192,23 +3231,140 @@ tr:hover td { background: rgba(79, 156, 249, 0.05); }
     };
   }
 
-  async function persistHosts() {
-    const entries: HostEntry[] = hosts.map((h) => ({ addr: h.addr }));
-    await invoke("save_hosts", { hosts: entries });
+  // ip:端口 已带端口就用原样;裸 IP 补当前应用默认端口
+  function makeAddr(ip: string, port: number | string): string {
+    ip = ip.trim();
+    if (!ip) return "";
+    if (ip.includes(":")) return ip;
+    const p = Number(port);
+    if (!(p >= 1 && p <= 65535)) return "";
+    return `${ip}:${p}`;
   }
 
+  // ---- 项目配置持久化 ----
+  async function loadApps() {
+    apps = await invoke<AppProfile[]>("load_apps");
+    if (apps.length === 0) apps = [blankProject("项目A")];
+    await switchApp(0, false);
+  }
+
+  // 主机列表是独立工作态,保存前同步回当前项目
+  async function persistApps() {
+    const p = currentProject();
+    if (p) p.hosts = hosts.map((h) => ({ addr: h.addr }));
+    apps = apps; // 触发下拉框选项文本(台数/端口)重渲染
+    await invoke("save_apps", { apps });
+  }
+
+  // 更新包输入框用:改动防抖落盘
+  let saveTimer: ReturnType<typeof setTimeout> | undefined;
+  function persistProject() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => { persistApps().catch(() => {}); }, 300);
+  }
+
+  async function switchApp(i: number, autoprobe = true) {
+    activeIdx = i;
+    hosts = apps[i].hosts.map((e) => freshHost(e.addr));
+    newPort = apps[i].port;
+    importFrom = "";
+    dist = null;
+    distError = "";
+    if (apps[i].dist_dir?.trim()) refreshDist();
+    if (autoprobe) hosts.forEach((h) => probeOne(h.addr));
+  }
+
+  function uniqueName(base: string): string {
+    if (!apps.some((a) => a.name === base)) return base;
+    for (let n = 2; ; n++) {
+      const name = `${base}-${n}`;
+      if (!apps.some((a) => a.name === name)) return name;
+    }
+  }
+
+  async function createApp() {
+    const name = uniqueName(newName.trim() || `项目${apps.length + 1}`);
+    apps = [...apps, blankProject(name, newPort || 7600)];
+    newName = "";
+    addingApp = false;
+    await switchApp(apps.length - 1, false);
+    await persistApps();
+  }
+
+  async function renameApp() {
+    const n = renameText.trim();
+    if (n && active) {
+      active.name = n;
+      apps = apps;
+      await persistApps();
+    }
+    renaming = false;
+  }
+
+  async function deleteApp() {
+    apps = apps.filter((_, i) => i !== activeIdx);
+    if (apps.length === 0) apps = [blankProject("项目A")];
+    await switchApp(Math.max(0, Math.min(activeIdx, apps.length - 1)), false);
+    await persistApps();
+  }
+
+  async function changePort() {
+    if (!active) return;
+    let p = Number(String(active.port).replace(/\D/g, ""));
+    if (!(p >= 1 && p <= 65535)) p = 7600;
+    active.port = p;
+    newPort = p;
+    apps = apps;
+    await persistApps();
+  }
+
+  // ---- 主机增删 ----
   async function addHost() {
-    const a = newAddr.trim();
+    const a = makeAddr(newIp, newPort);
     if (!a || hosts.some((h) => h.addr === a)) return;
     hosts = [...hosts, freshHost(a)];
-    newAddr = "";
-    await persistHosts();
+    newIp = "";
+    await persistApps();
     probeOne(a);
   }
 
   async function removeHost(addr: string) {
     hosts = hosts.filter((h) => h.addr !== addr);
-    await persistHosts();
+    await persistApps();
+  }
+
+  // 批量添加:一行/一条一个 IP 或 ip:端口,逗号空格分隔也行
+  async function batchAdd() {
+    const tokens = batchText.split(/[\s,;，；]+/).filter(Boolean);
+    const fresh: HostState[] = [];
+    for (const t of tokens) {
+      const a = makeAddr(t, newPort);
+      if (a && !hosts.some((h) => h.addr === a) && !fresh.some((h) => h.addr === a))
+        fresh.push(freshHost(a));
+    }
+    if (fresh.length === 0) return;
+    hosts = [...hosts, ...fresh];
+    batchText = "";
+    await persistApps();
+    pushLog("批量添加", `新增 ${fresh.length} 台,跳过无效/重复 ${tokens.length - fresh.length} 条`);
+    fresh.forEach((h) => probeOne(h.addr));
+  }
+
+  // 把另一个应用配置好的机器整批导入(端口随源配置逐台保留)
+  async function importHosts() {
+    const src = apps.find((a) => a.name === importFrom);
+    if (!src) return;
+    const fresh: HostState[] = [];
+    for (const e of src.hosts) {
+      if (!hosts.some((h) => h.addr === e.addr) && !fresh.some((h) => h.addr === e.addr))
+        fresh.push(freshHost(e.addr));
+    }
+    if (fresh.length === 0) return;
+    hosts = [...hosts, ...fresh];
+    importFrom = "";
+    await persistApps();
+    pushLog("导入机器", `从「${src.name}」导入 ${fresh.length} 台`);
+    fresh.forEach((h) => probeOne(h.addr));
   }
 
   // ---- 探测 ----
@@ -2218,7 +3374,7 @@ tr:hover td { background: rgba(79, 156, 249, 0.05); }
     h.probing = true;
     hosts = hosts;
     try {
-      const r = await invoke<ProbeResult>("cmd_probe", { addr, token: token || null });
+      const r = await invoke<ProbeResult>("cmd_probe", { addr, token: currentProject()?.token || null });
       h.reachable = r.reachable;
       h.version = r.version;
       h.os = r.os;
@@ -2240,12 +3396,14 @@ tr:hover td { background: rgba(79, 156, 249, 0.05); }
   async function refreshDist() {
     distError = "";
     dist = null;
-    if (!distDir.trim()) return;
+    const p = currentProject();
+    const dir = p?.dist_dir?.trim() || "";
+    if (!dir) return;
     try {
       const r = await invoke<DistInfo>("cmd_dist_info", {
-        distDir: distDir.trim(),
-        main: mainExe.trim() || null,
-        overwriteConfig,
+        distDir: dir,
+        main: p?.main_exe?.trim() || null,
+        overwriteConfig: !!p?.overwrite_config,
       });
       if (r.ok) dist = r;
       else distError = r.error;
@@ -2259,16 +3417,17 @@ tr:hover td { background: rgba(79, 156, 249, 0.05); }
     if (pushing || targets.length === 0 || !dist?.ok) return;
     pushing = true;
     hosts = hosts.map((h) => (targets.includes(h.addr) ? { ...h, updating: true } : h));
+    const p = currentProject();
     const jobs = targets.map(async (addr) => {
       try {
         const r = await invoke<any>("cmd_update_host", {
           addr,
-          distDir: distDir.trim(),
-          main: mainExe.trim() || null,
-          token: token || null,
-          signKey: signKey.trim() || null,
-          overwriteConfig,
-          timeoutSecs,
+          distDir: p?.dist_dir?.trim() || "",
+          main: p?.main_exe?.trim() || null,
+          token: p?.token || null,
+          signKey: p?.sign_key?.trim() || null,
+          overwriteConfig: !!p?.overwrite_config,
+          timeoutSecs: Number(p?.timeout_secs) || 120,
         });
         const h = findHost(addr);
         if (h) {
@@ -2304,29 +3463,27 @@ tr:hover td { background: rgba(79, 156, 249, 0.05); }
     updateHosts(hosts.filter((h) => h.lastResult && !h.lastOk).map((h) => h.addr));
 
   onMount(async () => {
-    await loadHosts();
+    await loadApps();
     await listen<LogLine>("update-log", (e) => {
       const { addr, line } = e.payload;
-      logs = [...logs.slice(-500), { addr, line, at: now() }];
-      if (logEl) logEl.scrollTop = logEl.scrollHeight;
+      pushLog(addr, line);
     });
-    hosts.forEach((h) => probeOne(h.addr));
   });
 </script>
 
 <div class="panel">
-  <h2>更新包</h2>
+  <h2>更新包 <span class="meta">· 随项目「{active?.name || ""}」保存</span></h2>
   <div class="row">
-    <input type="text" class="grow" placeholder="新版 dist 目录,如 D:\dist" bind:value={distDir} on:change={refreshDist} />
-    <input type="text" style="width: 130px" placeholder="主程序(可选)" bind:value={mainExe} on:change={refreshDist} />
-    <label class="hint"><input type="checkbox" bind:checked={overwriteConfig} on:change={refreshDist} /> 覆盖 config.json</label>
+    <input type="text" class="grow" placeholder="新版 dist 目录,如 D:\dist" bind:value={active.dist_dir} on:change={() => { refreshDist(); persistProject(); }} />
+    <input type="text" style="width: 130px" placeholder="主程序(可选)" bind:value={active.main_exe} on:change={() => { refreshDist(); persistProject(); }} />
+    <label class="hint"><input type="checkbox" bind:checked={active.overwrite_config} on:change={() => { refreshDist(); persistProject(); }} /> 覆盖 config.json</label>
     <button on:click={refreshDist}>重新计算</button>
   </div>
   <div class="row" style="margin-top: 8px">
-    <input type="password" style="width: 200px" placeholder="Token(可选)" bind:value={token} />
-    <input type="password" style="width: 200px" placeholder="签名私钥 hex(可选)" bind:value={signKey} />
+    <input type="password" style="width: 200px" placeholder="Token(可选)" bind:value={active.token} on:change={persistProject} />
+    <input type="password" style="width: 200px" placeholder="签名私钥 hex(可选)" bind:value={active.sign_key} on:change={persistProject} />
     <span class="hint">轮询超时</span>
-    <input type="text" style="width: 60px" bind:value={timeoutSecs} />
+    <input type="text" style="width: 60px" bind:value={active.timeout_secs} on:change={persistProject} />
     <span class="hint">秒</span>
   </div>
   {#if dist}
@@ -2343,9 +3500,63 @@ tr:hover td { background: rgba(79, 156, 249, 0.05); }
 
 <div class="panel">
   <div class="row">
-    <h2 class="grow">主机({hosts.length})</h2>
-    <input type="text" style="width: 220px" placeholder="IP[:7600]" bind:value={newAddr} on:keydown={(e) => e.key === "Enter" && addHost()} />
+    {#if renaming}
+      <h2 class="grow">项目</h2>
+      <input type="text" style="width: 220px" bind:value={renameText}
+        on:keydown={(e) => { if (e.key === "Enter") renameApp(); if (e.key === "Escape") renaming = false; }} />
+      <button class="primary" on:click={renameApp}>确定</button>
+      <button on:click={() => (renaming = false)}>取消</button>
+    {:else if addingApp}
+      <h2 class="grow">项目</h2>
+      <input type="text" style="width: 220px" placeholder="新项目名,如 项目C" bind:value={newName}
+        on:keydown={(e) => { if (e.key === "Enter") createApp(); if (e.key === "Escape") (addingApp = false); }} />
+      <button class="primary" on:click={createApp}>创建</button>
+      <button on:click={() => (addingApp = false)}>取消</button>
+    {:else}
+      <h2 class="grow">项目(推送对象)</h2>
+      <select bind:value={activeIdx} on:change={() => switchApp(activeIdx)}>
+        {#each apps as a, i}
+          <option value={i}>{a.name} · {a.hosts.length}台 · 端口{a.port}</option>
+        {/each}
+      </select>
+      <button on:click={() => { renaming = true; renameText = active?.name || ""; }}>改名</button>
+      <button on:click={() => { addingApp = true; newName = ""; }}>新增项目</button>
+      <button class="danger" on:click={deleteApp}>删除项目</button>
+      <span class="hint">默认端口</span>
+      <input type="text" style="width: 60px" bind:value={active.port} on:change={changePort} />
+    {/if}
+  </div>
+
+  {#if batchOpen}
+    <div class="row" style="margin-top: 8px">
+      <textarea class="grow" rows="3" bind:value={batchText}
+        placeholder="粘贴机器列表一次添加:每行一个 IP(端口用上方默认端口),也可写 ip:端口 覆盖;空格/逗号分隔均可&#10;192.168.1.60&#10;192.168.1.61:7601"></textarea>
+    </div>
+    <div class="row" style="margin-top: 6px">
+      <button class="primary" on:click={batchAdd}>批量添加</button>
+      <select bind:value={importFrom}>
+        <option value="" disabled>从其他项目整批导入已配好的机器…</option>
+        {#each apps as a, i}
+          {#if i !== activeIdx}
+            <option value={a.name}>{a.name}({a.hosts.length}台)</option>
+          {/if}
+        {/each}
+      </select>
+      <button on:click={importHosts} disabled={!importFrom}>导入</button>
+      <span class="grow"></span>
+      <button on:click={() => (batchOpen = false)}>收起</button>
+    </div>
+  {/if}
+
+  <div class="row" style="margin-top: 8px">
+    <h2 class="grow">{active?.name || ""} 主机({hosts.length})</h2>
+    <input type="text" style="width: 200px" placeholder="IP,如 192.168.1.60" bind:value={newIp}
+      on:keydown={(e) => e.key === "Enter" && addHost()} />
+    <span class="hint">:</span>
+    <input type="text" style="width: 64px" bind:value={newPort}
+      on:keydown={(e) => e.key === "Enter" && addHost()} />
     <button on:click={addHost}>添加</button>
+    <button on:click={() => (batchOpen = !batchOpen)}>{batchOpen ? "收起批量" : "批量添加"}</button>
     <button on:click={probeAll} disabled={pushing}>探测全部</button>
     <button on:click={updateSelected} disabled={pushing || !dist?.ok}>更新选中</button>
     <button on:click={retryFailed} disabled={pushing || !dist?.ok}>重试失败</button>
@@ -2389,7 +3600,9 @@ tr:hover td { background: rgba(79, 156, 249, 0.05); }
           </td>
         </tr>
       {:else}
-        <tr><td colspan="7" class="meta" style="text-align: center; padding: 18px">添加目标主机地址开始(目标需已集成 ghost-updater)</td></tr>
+        <tr><td colspan="7" class="meta" style="text-align: center; padding: 18px">
+          「{active?.name}」还没有机器:填 IP 添加,或用「批量添加」粘一排 IP 一次全加
+        </td></tr>
       {/each}
     </tbody>
   </table>
@@ -7098,10 +8311,55 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager};
 
-/// 主机列表条目(持久化到 app_config_dir/hosts.json)
+/// 主机列表条目(随项目配置持久化)
 #[derive(Serialize, Deserialize, Clone)]
 struct HostEntry {
     addr: String,
+}
+
+fn default_timeout() -> u32 {
+    120
+}
+
+/// 项目配置:一个集成了更新接口的目标应用 = 更新包配置 + 默认端口 + 机器列表,整档保存
+#[derive(Serialize, Deserialize, Clone)]
+struct AppProfile {
+    name: String,
+    port: u16,
+    hosts: Vec<HostEntry>,
+    /// 本机新版 dist 目录
+    #[serde(default)]
+    dist_dir: String,
+    /// 主程序文件名(可选,空 = dist 内唯一 *.exe)
+    #[serde(default)]
+    main_exe: String,
+    /// true = 连 config.json 也覆盖
+    #[serde(default)]
+    overwrite_config: bool,
+    #[serde(default)]
+    token: String,
+    /// ed25519 私钥 hex(可选)
+    #[serde(default)]
+    sign_key: String,
+    /// 轮询确认超时(秒)
+    #[serde(default = "default_timeout")]
+    timeout_secs: u32,
+}
+
+impl Default for AppProfile {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            port: 0,
+            hosts: Vec::new(),
+            dist_dir: String::new(),
+            main_exe: String::new(),
+            overwrite_config: false,
+            token: String::new(),
+            sign_key: String::new(),
+            timeout_secs: default_timeout(),
+        }
+    }
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -7269,29 +8527,111 @@ async fn cmd_update_host(
     }
 }
 
-fn hosts_file(app: &AppHandle) -> Result<PathBuf, String> {
+fn config_file(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_config_dir()
         .map_err(|e| format!("配置目录不可用: {e}"))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
-    Ok(dir.join("hosts.json"))
+    Ok(dir.join(name))
+}
+
+/// 旧的全局"更新包"设置(仅用于一次性迁移进项目;迁移后删除该文件)
+#[derive(Deserialize, Default)]
+struct LegacySettings {
+    #[serde(default)]
+    dist_dir: String,
+    #[serde(default)]
+    main_exe: String,
+    #[serde(default)]
+    overwrite_config: bool,
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    sign_key: String,
+    #[serde(default)]
+    timeout_secs: u32,
+}
+
+impl LegacySettings {
+    /// 全空则视为没有可迁移的内容
+    fn is_empty(&self) -> bool {
+        self.dist_dir.is_empty()
+            && self.main_exe.is_empty()
+            && !self.overwrite_config
+            && self.token.is_empty()
+            && self.sign_key.is_empty()
+    }
+
+    fn apply_to(&self, a: &mut AppProfile) {
+        a.dist_dir = self.dist_dir.clone();
+        a.main_exe = self.main_exe.clone();
+        a.overwrite_config = self.overwrite_config;
+        a.token = self.token.clone();
+        a.sign_key = self.sign_key.clone();
+        if self.timeout_secs > 0 {
+            a.timeout_secs = self.timeout_secs;
+        }
+    }
+}
+
+/// 读取 apps.json;不存在但旧 hosts.json 存在时,迁移为单档"默认项目"
+fn read_apps(app: &AppHandle) -> Vec<AppProfile> {
+    let Ok(path) = config_file(app, "apps.json") else { return vec![] };
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        if let Ok(apps) = serde_json::from_str::<Vec<AppProfile>>(&s) {
+            return apps;
+        }
+    }
+    // 兼容旧版单列表 hosts.json
+    let Ok(old) = config_file(app, "hosts.json") else { return vec![] };
+    let Ok(s) = std::fs::read_to_string(old) else { return vec![] };
+    let Ok(hosts) = serde_json::from_str::<Vec<HostEntry>>(&s) else { return vec![] };
+    if hosts.is_empty() {
+        return vec![];
+    }
+    vec![AppProfile { name: "默认项目".into(), port: 7600, hosts, ..Default::default() }]
+}
+
+/// 读取项目列表;首启把旧 settings.json 的更新包设置并入项目,随后删除旧文件
+#[tauri::command]
+fn load_apps(app: AppHandle) -> Vec<AppProfile> {
+    let mut apps = read_apps(&app);
+    let Ok(path) = config_file(&app, "settings.json") else { return apps };
+    let Ok(s) = std::fs::read_to_string(&path) else { return apps };
+    let Ok(legacy) = serde_json::from_str::<LegacySettings>(&s) else { return apps };
+    if !legacy.is_empty() {
+        if apps.is_empty() {
+            let mut p = AppProfile { name: "默认项目".into(), port: 7600, ..Default::default() };
+            legacy.apply_to(&mut p);
+            apps.push(p);
+        } else {
+            for a in &mut apps {
+                if a.dist_dir.is_empty() {
+                    legacy.apply_to(a);
+                }
+            }
+        }
+        // 马上落盘,避免"还没保存"期间旧文件被删而丢设置
+        if let Err(e) = write_apps(&app, &apps) {
+            eprintln!("迁移项目配置落盘失败: {e}");
+            return apps;
+        }
+    }
+    // 已逐项并入项目,旧文件不再需要
+    let _ = std::fs::remove_file(&path);
+    apps
+}
+
+fn write_apps(app: &AppHandle, apps: &[AppProfile]) -> Result<(), String> {
+    let path = config_file(app, "apps.json")?;
+    let body = serde_json::to_string_pretty(apps).map_err(|e| e.to_string())?;
+    std::fs::write(path, body).map_err(|e| format!("保存项目配置失败: {e}"))
 }
 
 #[tauri::command]
-fn load_hosts(app: AppHandle) -> Vec<HostEntry> {
-    let Ok(path) = hosts_file(&app) else { return vec![] };
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-#[tauri::command]
-fn save_hosts(app: AppHandle, hosts: Vec<HostEntry>) -> Result<(), String> {
-    let path = hosts_file(&app)?;
-    let body = serde_json::to_string_pretty(&hosts).map_err(|e| e.to_string())?;
-    std::fs::write(path, body).map_err(|e| format!("保存主机列表失败: {e}"))
+fn save_apps(app: AppHandle, apps: Vec<AppProfile>) -> Result<(), String> {
+    write_apps(&app, &apps)
 }
 
 fn main() {
@@ -7300,8 +8640,8 @@ fn main() {
             cmd_probe,
             cmd_dist_info,
             cmd_update_host,
-            load_hosts,
-            save_hosts
+            load_apps,
+            save_apps
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -7517,6 +8857,157 @@ ghost_updater::start_agent("0.0.0.0:9001", &auth_token);
 | 设计补 | net apply | 重启后宿主丢了原始启动参数(默认端口起服务),推送端轮询旧地址永远失败 | apply 缺省透传本进程原始 argv 作 relaunch_args |
 | e2e | 断言时序 | pusher 见到 restarted=true 时 worker 还没做健康检查后的备份清理 | e2e 轮询等备份目录消失 |
 | gui | src-tauri Cargo.toml | path 依赖 `../ghost-updater-cli` 相对 src-tauri 解析,找不到 | 改 `../../ghost-updater-cli` |
+
+---
+
+## 追加变更:GUI 构建/运行/打包统一入口脚本
+
+### 目标
+
+`cargo run` 在 debug 下走 `tauri.conf.json` 的 `devUrl`(http://localhost:5173),而 `beforeDevCommand`
+只有 `tauri dev` 才会执行;直接 `cargo run` 必然 WebView2 报 ERR_CONNECTION_REFUSED。
+用脚本收敛成一条命令,并把"改前端 / 跑窗口 / 出安装包"三条路径分开。
+
+### 方案取舍
+
+- 脚本落 `tools/gui.ps1`(与既有 `tools/e2e.ps1` 同目录同风格),子命令:
+  - `dev`   → `npm run tauri -- dev`(CLI 自动起 Vite,热更新,走 devUrl 是正确的)
+  - `run`   → `npm run tauri -- build --debug --no-bundle`,再拉起 debug exe。
+            这是"Rust 用 debug、前端用已构建 webdist"的官方 CLI 路径(不走 devUrl)。
+            备选是仓库文档里的 `cargo run --features tauri/custom-protocol`(已核
+            tauri-build-2.7.1/src/lib.rs:591 `is_dev()`:`dev` cfg = tauri 是否未启用
+            `custom-protocol`),功能等价;脚本选 CLI 路径以免与"手动跑"两套说法打架。
+            已实测:窗口正常渲染出界面,无 ERR_CONNECTION_REFUSED。
+  - `build` → `npm run build`(仅 vite → webdist)
+  - `check` → `npm run build` + GUI crate `cargo check`(generate_context! 编译期读 webdist,必须先有)
+  - `installer` → `npm run tauri -- build` → NSIS
+  - `verify` → 主 workspace `cargo build/test` + GUI `check`(复刻 TODO 完成标准)
+- `run` / `installer` 前先 `Stop-Running`:上次运行的 GUI 会锁住 exe,不关掉 cargo 覆盖必报 os error 5。
+- 不改 `tauri.conf.json`:devUrl 是 Tauri 的标准开发配置,问题在调用方式不在配置。
+- `tools/gui.cmd` 薄包装:cmd 下免写 `-ExecutionPolicy Bypass -File`;必须纯 ASCII
+  (cmd 按 GBK 读 .cmd 文件,中文注释会被嚼成命令)。
+
+### 假设
+
+- `npx tauri` / `npm run tauri` 解析到本地 `node_modules/.bin/tauri`(已确认存在);缺 node_modules 时
+  脚本直接 FAIL 并提示 `npm install`,不自动 install(联网副作用不进脚本)。
+- `npm run tauri -- build --debug --no-bundle` 会先跑 `beforeBuildCommand`(npm run build),
+  所以 `run` 无需自己再构建前端。依据:`tauri build --help` 明示会执行 beforeBuildCommand。
+- native 命令的 stderr 在 `$ErrorActionPreference=Stop` 下可能变 terminating error(见既有错误表),
+  故 npm/cargo 一律经 `cmd /c "... 2>&1"` 调用,只看 `$LASTEXITCODE`。
+
+### 错误记录表(追加)
+
+| 时间 | 位置 | 报错/问题 | 处置 |
+|---|---|---|---|
+| 运行 | WebView2 | `cargo run` 后窗口 ERR_CONNECTION_REFUSED(localhost:5173) | debug 走 devUrl 且无人起 Vite;改用脚本 `dev` / `run` |
+| 打包 | cargo 链接 | 上一次运行的推送台进程锁住 debug exe → `failed to remove file ... 拒绝访问 (os error 5)` | `run` / `installer` 前 `Stop-Running`(Stop-Process 同名进程) |
+| 脚本 | tools/gui.cmd | 中文注释被 cmd 按 GBK 解读,注释里的 `\|` 触发分词,报 `'鐢ㄦ硶:' 不是内部或外部命令` | 包装脚本改纯 ASCII(中文只留在带 BOM 的 .ps1 里) |
+
+---
+
+## 追加变更:项目整档保存(更新包设置并入项目)
+
+### 目标
+
+推送台此前只把「应用名 / 默认端口 / 机器列表」存进 apps.json,而「更新包」面板的
+`dist 目录 / 主程序 / 覆盖 config / Token / 签名私钥 / 轮询超时` 是全局单份(settings.json),
+切换应用不跟着换。用户有多个应用各配一套更新包,需要「更新包配置 + 目标主机」整档保存、随项目切换。
+
+### 方案取舍
+
+- 把 6 个更新包字段并入 `AppProfile`(即"项目"):一个项目 = 更新包配置 + 默认端口 + 主机列表,
+  apps.json 成为唯一持久化,不再需要 settings.json。
+- 前端那 6 个输入框由全局变量改为"当前项目的工作副本":切换项目时从 `apps[idx]` 拉取,
+  改动防抖写回该项目。
+- 兼容:`AppProfile` 新字段全部 `#[serde(default)]`(timeout 默认 120);`load_apps` 首启一次性把旧
+  settings.json 的更新包设置补进"还没有 dist 的项目"(无项目则新建"默认项目"),随后删除旧文件。
+- UI 文案「应用」→「项目」;领域上仍是目标机上的一个集成应用,一个应用即一个项目。
+
+### 影响面
+
+- `crates/ghost-updater-tauri/src-tauri/src/main.rs`:AppProfile 扩字段;load_apps 迁移;
+  删 `load_settings`/`save_settings` 命令及 handler 注册;旧 hosts.json 迁移名改「默认项目」。
+- `crates/ghost-updater-tauri/src/App.svelte`:接口扩字段;更新包面板绑定 `active.*`;pull/push 项目;
+  去掉全局 settings 持久化。
+- `README.md` / `HowToUseAutoUpdate.md`:一句带过。
+
+### 假设
+
+- 单级结构:一个项目 = 一个目标应用(一套 exe/端口),不做"项目下再分多个应用"的两级。
+  依据:现有「应用」已是 名称+端口+主机 的单位,用户原话"项目+接受推送的主机"亦为单级组合。
+- 迁移后删除 settings.json 安全:6 项已逐项复制进项目,不丢数据。
+- Token / 签名私钥随项目落 apps.json,与原先落 settings.json 的明文同级别,安全边界不变。
+
+### 错误记录表(追加)
+
+| 时间 | 位置 | 报错/问题 | 处置 |
+|---|---|---|---|
+| 项目保存 | App.svelte | `$: active = apps[activeIdx]` 是派生值,`activeIdx` 同步改后到 reactivity flush 前仍是旧项目;`switchApp` 里紧接着 `refreshDist()` 会预览到上一个项目的 dist | 函数内统一改用 `currentProject() = apps[activeIdx]`,只在模板里用 `active` |
+| 项目保存 | main.rs | `#[derive(Default)]` 的 `timeout_secs` 是 `u32::default()=0`,不是 serde 的 120;Rust 侧新建的"默认项目"轮询超时显示 0 | 手写 `impl Default for AppProfile`,`timeout_secs: default_timeout()` |
+
+---
+
+## 追加变更:Model Copy 三需求(REQ-2 swap 失败回滚 / REQ-3 拒绝路径 drain / REQ-1 多进程编排)
+
+### 目标
+
+落地 plan/feature-requests-from-model-copy.md 三项:swap 半途失败自动回滚并释放 `.apply-lock`;
+stage/apply 拒绝时 drain 请求体让 401 稳定可见;`UpdateConfig.close_processes` 多进程换版编排。
+wire 协议零变化,空配置行为不变。
+
+### 方案取舍
+
+- **REQ-2 回滚不做全量 `restore_backup`,改为"只还原已覆盖的文件"**。原案(备份里没有的
+  当新增删掉)有个数据丢失陷阱:若失败点之后的旧文件没被覆盖、也没进备份(备份段部分失败),
+  restore 会把它们当"本次新增"删除;且 swap 失败时旧文件常仍被外部句柄锁着,restore 的
+  remove+copy 会被 os error 32 卡死。实现:`swap_files` 拆成 `ensure_staged`/`backup_files`/
+  `overwrite_files` 三段(组合壳保持原 API,4 个存量单测不动),`overwrite_files` 失败时仅对
+  已成功覆盖的文件按备份逐个还原、对"备份里没有且刚创建"的删除——只动确实覆盖过的文件,
+  Err 时 install 必已回旧状态,error 文案区分"(已回滚到旧状态)"与"(回滚失败,需人工介入:…)"。
+  备份段失败 = 文件未动,不触发任何还原。`rollback()`/`restore_backup` 保留给健康检查/拉起
+  失败路径(那时文件锁已释放,全量还原安全)。
+- **锁收口**:`run_apply` 拆 parse → inner → `release_lock` 无条件兜底。核验发现泄漏面共 4 条
+  失败路径(pid 超时/swap/健康检查/拉起),需求只点名 2 条,收口一次全覆盖。
+- **REQ-3 drain 只落 stage**。核验:apply 的 `body: String` 是 axum 提取器,handler 执行前
+  body 已读完,天然无此问题;需求里"stage/apply 拒绝"的 apply 半句不成立。stage 的 check_auth
+  拒绝(401/503)与 sha256/main 两个 400 分支都在 body 消费前拒绝,一并 drain(上限
+  MAX_PACKAGE_BYTES,整体 30s 超时防慢速攻击)。
+- **REQ-1 两级编排**:agent 侧(apply 受理、鉴权后)`spawn_blocking(close_processes_graceful)`
+  后再 exit(0)——自退从固定 800ms 变为"800ms + 关闭耗时",worker 的 wait_pid(15s)天然把
+  关闭窗口吃进去;名单经 worker argv `--close a.exe,b.exe` 交接,worker 在等完 `--pid` 后再
+  `wait_processes_exit`(轮询 tasklist,超时 taskkill /F 兜底,镜像 wait_pid_exit 语义)。
+  非 Windows 全部 no-op(REQ 明示可留空)。进程名白名单 `validate_process_names`
+  (仅 `[A-Za-z0-9._-]`)双端校验:routes() 启动 panic(与 pubkey 同风格)+ worker parse,
+  防 taskkill/tasklist 参数注入。
+- **进程操作选 tasklist/taskkill 子进程**(CSV 首列精确比对),不引 Toolhelp32 快照:
+  与既有 wait_pid_exit 的 taskkill 风格一致,零新增 unsafe;GBK 输出里文件名列是 ASCII,
+  utf8_lossy 无损。
+- **close 动作落 apply.log**:core 开 `append_apply_log(install, msg)` pub 口,agent 关闭
+  开始/成功/失败三态都记,排障与 worker 日志同文件。
+
+### 影响面
+
+- core/src/lib.rs:锁收口、swap 三段拆分、close/wait/validate 进程原语、`--close` 参数、单测 +6。
+- net/src/lib.rs:UpdateConfig.close_processes、routes() 校验、drain_body、stage 拒绝分支 drain、
+  apply argv/自退编排、单测 +1(真 TCP)。
+- demo-app:`--close-processes <a.exe,b.exe>` 参数。
+- tools/e2e.ps1:+REQ-2/REQ-3/REQ-1 三场景(见 TODO 核验节)。
+- README/HowToUse:字段、回滚语义、排障表同步;ghost-push/tauri 零改动(推送端属非目标)。
+
+### 假设
+
+- worker 等关联进程超时(10s)按 pid 超时同款处理:放弃更新(文件未动),由 agent 已做过的
+  优雅关闭 + /F 兜底保证实际到不了这一步。
+- 换版后被关进程的自动重启留宿主(需求建议的非目标);Model Copy 计划用"GUI 原在运行"标记。
+- 关联进程名单不进 manifest/不含版本概念,纯粹本机编排参数,故走 argv 不走暂存文件。
+
+### 错误记录表(追加)
+
+| 时间 | 位置 | 报错/问题 | 处置 |
+|---|---|---|---|
+| e2e | REQ-2 断言 | PS5.1 `Get-Content` 按 GBK 读 UTF-8 的 result.json,中文断言全乱码(与早前 BOM 坑同源) | `Get-Content -Raw -Encoding UTF8`;对外输出断言一律改 ASCII 锚点(如 `HTTP status client error` / `error sending request`) |
+| e2e | REQ-1 推送 | dist-v4 含 2 个 exe,ghost-push 拒包"需用 --main 指定" | 推送加 `--main ghost-demo.exe`(既有规则,非 bug) |
 ````
 
 ## File: plan/TODO.md
@@ -7542,6 +9033,42 @@ ghost_updater::start_agent("0.0.0.0:9001", &auth_token);
 - e2e.ps1 全绿 ✓(含 started_at 确认重启、401 安全边界)
 - gui: `npm run build` 产 webdist ✓ + `cargo check` ✓(gui 不阻塞主 workspace)
 - 所有变更路由强制安全校验 ✓;guard 零网络依赖 ✓
+
+## 追加:GUI 构建/运行/打包统一入口脚本
+
+1. [done] tools/gui.ps1:子命令 dev / run / build / check / installer / verify + 无参 usage;绝对路径,任意 cwd 可用;
+   run/installer 前 Stop-Running(上次实例锁 exe → os error 5)
+2. [done] tools/gui.cmd:cmd 下的薄包装(`tools\gui.cmd dev`),纯 ASCII(GBK 会嚼烂中文注释),透传退出码
+3. [done] README/HowToUse 补脚本用法表,并写明"不要直接 cargo run(debug 走 devUrl 会拒连)"
+4. [done] 实测:check ✓ / run ✓(截图确认窗口渲染出界面,非报错页)/ verify ✓(14 单测全绿);
+   installer 未跑(首次会拉 NSIS 工具链)
+
+## 追加:项目整档保存(更新包设置并入项目)
+
+1. [done] main.rs:AppProfile 扩 6 字段 + 旧 settings 一次性迁移(迁移即落盘、删旧文件)+ 删 settings 命令
+2. [done] App.svelte:更新包面板直接绑定当前项目(去全局 settings);函数内用 currentProject() 规避 $: 派生变量的同步滞后
+3. [done] 文案 应用→项目;README/HowToUse 各补一句
+4. [done] `npm run build` ✓ + `cargo check`(GUI crate)✓
+
+## 追加:来自 Model Copy 生产集成的三项需求(2026-10-10)
+
+1. [done] REQ-2(P1) swap 失败回滚 + 所有失败路径释放 .apply-lock(core)
+2. [done] REQ-3(P2) stage/apply 拒绝路径 drain 请求体,401 稳定可见(net)
+3. [done] REQ-1(P2) UpdateConfig.close_processes + worker 多进程等待编排(net/core;Model Copy 已有宿主侧中间件 workaround)
+   详案(三语):plan/feature-requests-from-model-copy.md;实施取舍:plan/design.md 追加变更节
+
+## 完成标准核验(三需求批次)
+
+- `cargo build --workspace` ✓ / `cargo test --workspace` 21/21 ✓(存量 14 + 新增 7:
+  swap 失败回滚+锁释放[windows]、进程名白名单、--close 解析、按名探活/等待/优雅关闭、
+  真 TCP 大包体 401 可见)
+- e2e.ps1 全绿 ✓,新增三场景:
+  - REQ-2:锁 NOTES.txt(share Read)逼停覆盖段 → result 标注"已回滚"、VERSION 回 2.0.0、
+    全部 stage-* 无 .apply-lock、旧版无参重拉(7600)可达;释放锁重推 2.0.0→3.0.0 ✓
+  - REQ-3:错 token 推 17MB ×10 → 每次都是 error_for_status 401,0 次 "error sending request"
+  - REQ-1:demo-gui.exe 常驻持锁 + `--close-processes demo-gui.exe` → 优雅关闭(taskkill 无 /F 即成,
+    未走到 /F 兜底)→ 4 文件全量 swap → 主程序自恢复 3.0.0→4.0.0,demo-gui.exe 哈希换新 ✓
+- GUI(tauri)零改动且不依赖 net/core 新接口,未重跑 gui check;wire 协议零变化 ✓
 ````
 
 ## File: tools/e2e.ps1
@@ -7564,9 +9091,10 @@ function Ok($msg)   { Write-Host "[OK]   $msg" -ForegroundColor Green }
 
 # 0. 清场(先杀残留进程,再删工作目录)
 Get-Process ghost-demo -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process demo-gui  -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 300
 if (Test-Path $E2E) { Remove-Item -Recurse -Force $E2E }
-New-Item -ItemType Directory -Force -Path "$E2E\dist-v1", "$E2E\dist-v2", "$E2E\install" | Out-Null
+New-Item -ItemType Directory -Force -Path "$E2E\dist-v1", "$E2E\dist-v2", "$E2E\install", "$E2E\dist-v3", "$E2E\dist-v3-big", "$E2E\dist-v4" | Out-Null
 
 # 1. 构建(demo-app 与 ghost-push 一次构建)
 Write-Host "== cargo build =="
@@ -7636,8 +9164,86 @@ if (-not $result.ok) { Fail "result.json ok=false: $($result.error)" }
 Write-Host "       v2 probe: version=$($probe2.version) started_at=$($probe2.started_at)"
 Ok "版本 1.0.0 → 2.0.0,config 保留,备份已清,result.json ok"
 
-# 8. 清理
+# 8. REQ-2:锁住安装目录文件逼停 swap → 自动回滚 + 锁释放,重推可成功
+Copy-Item $Demo "$E2E\dist-v3\ghost-demo.exe"
+Set-Content -Encoding Ascii "$E2E\dist-v3\VERSION" "3.0.0"
+Set-Content -Encoding Ascii "$E2E\dist-v3\NOTES.txt" "v3 notes"
+# 锁"写"不锁"读"(FileShare.Read):worker 备份读得动,覆盖写必败(os error 32)
+$lock = [System.IO.File]::Open("$E2E\install\NOTES.txt", 'Open', 'Read', 'Read')
+Write-Host "== REQ-2: 锁 NOTES.txt 后推 v3,期望失败并自动回滚 =="
+$out = cmd /c "$Push push --target $Target --dist $E2E\dist-v3 --token $Token --timeout-secs 15 2>&1" | Out-String
+$rc = $LASTEXITCODE
+$lock.Close()
+if ($rc -eq 0) { Fail "锁文件状态下 v3 竟推送成功: $($out.Trim())" }
+$result = Get-Content -Raw -Encoding UTF8 "$E2E\install\.update_backup\result.json" | ConvertFrom-Json
+if ($result.ok) { Fail "REQ-2 result.json ok=true: $($result.error)" }
+if ($result.error -notmatch "已回滚") { Fail "REQ-2 result 未标注已回滚: $($result.error)" }
+if ((Get-Content "$E2E\install\VERSION" -Raw).Trim() -ne "2.0.0") { Fail "REQ-2 回滚后 VERSION 非 2.0.0" }
+$staleLock = Get-ChildItem "$E2E\.ghost-update" -Directory | Where-Object { Test-Path (Join-Path $_.FullName ".apply-lock") }
+if ($staleLock) { Fail "REQ-2 失败后 .apply-lock 泄漏: $($staleLock.Name -join ',')" }
+# 回滚后 worker 重拉旧版是无参启动,落默认端口 7600 —— 顺带验证服务已恢复
+$rb = $null
+for ($i = 0; $i -lt 10; $i++) {
+    try { $rb = Invoke-RestMethod "http://127.0.0.1:7600/update/probe"; break } catch { Start-Sleep -Milliseconds 500 }
+}
+if (-not $rb -or $rb.version -ne "2.0.0") { Fail "REQ-2 回滚重拉不可达或版本非 2.0.0" }
+Ok "REQ-2 swap 失败 → result 标注已回滚、无锁泄漏、旧版已重拉"
+
+# 回滚重拉是无参启动,杀掉后带参重启,供后续场景继续用
 Get-Process ghost-demo -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 300
+Start-Process -FilePath "$E2E\install\ghost-demo.exe" -ArgumentList "--addr","$Target","--token",$Token `
+    -WorkingDirectory $E2E -PassThru -WindowStyle Hidden | Out-Null
+Start-Sleep -Milliseconds 1500
+Write-Host "== REQ-2: 释放锁后重推 v3,期望成功 =="
+& $Push push --target $Target --dist "$E2E\dist-v3" --token $Token --timeout-secs 60
+if ($LASTEXITCODE -ne 0) { Fail "REQ-2 重推 v3 失败" }
+if ((Invoke-RestMethod "http://$Target/update/probe").version -ne "3.0.0") { Fail "REQ-2 重推后版本非 3.0.0" }
+Ok "REQ-2 重推 v3 成功(2.0.0 → 3.0.0)"
+
+# 9. REQ-3:错 token 推 17MB 大包 ×10,每次都必须是 stage 被拒 401,而非传输错误
+Copy-Item -Recurse -Force "$E2E\dist-v3\*" "$E2E\dist-v3-big\"
+[System.IO.File]::WriteAllBytes("$E2E\dist-v3-big\junk.bin", (New-Object byte[] (17MB)))
+Write-Host "== REQ-3: 错 token 推 17MB ×10,期望每次都稳定看到 401 =="
+for ($i = 1; $i -le 10; $i++) {
+    $out = cmd /c "$Push push --target $Target --dist $E2E\dist-v3-big --token wrong-$i --timeout-secs 5 2>&1" | Out-String
+    if ($LASTEXITCODE -eq 0) { Fail "REQ-3 第 $i 次错 token 竟成功: $($out.Trim())" }
+    # 断言用 ASCII 锚点(cmd 捕获会按 GBK 解码 ghost-push 的 UTF-8 输出,中文正则不可靠):
+    # "HTTP status client error" = error_for_status 路径(401 可见);"error sending request" = 传输错误
+    if ($out -notmatch "401") { Fail "REQ-3 第 $i 次未见 401: $($out.Trim())" }
+    if ($out -notmatch "HTTP status client error") { Fail "REQ-3 第 $i 次非 error_for_status 路径: $($out.Trim())" }
+    if ($out -match "error sending request") { Fail "REQ-3 第 $i 次仍是传输错误(401 不可见): $($out.Trim())" }
+}
+Ok "REQ-3 错 token ×10 全部稳定 401,0 次传输错误"
+
+# 10. REQ-1:双进程编排——demo-gui.exe 常驻并锁住自身,agent 优雅关闭后全量 swap 成功
+Copy-Item $Demo "$E2E\install\demo-gui.exe"
+Start-Process -FilePath "$E2E\install\demo-gui.exe" -ArgumentList "--addr","127.0.0.1:7701","--token",$Token `
+    -WorkingDirectory $E2E -PassThru -WindowStyle Hidden | Out-Null
+Start-Sleep -Milliseconds 1500
+if (-not (Get-Process demo-gui -ErrorAction SilentlyContinue)) { Fail "demo-gui 启动失败" }
+if ((Invoke-RestMethod "http://127.0.0.1:7701/update/probe").version -ne "3.0.0") { Fail "demo-gui probe 非 3.0.0" }
+Get-Process ghost-demo -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 300
+Start-Process -FilePath "$E2E\install\ghost-demo.exe" -ArgumentList "--addr","$Target","--token",$Token,"--close-processes","demo-gui.exe" `
+    -WorkingDirectory $E2E -PassThru -WindowStyle Hidden | Out-Null
+Start-Sleep -Milliseconds 1500
+Copy-Item $Demo "$E2E\dist-v4\ghost-demo.exe"
+Copy-Item $Demo "$E2E\dist-v4\demo-gui.exe"
+Set-Content -Encoding Ascii "$E2E\dist-v4\VERSION" "4.0.0"
+Set-Content -Encoding Ascii "$E2E\dist-v4\NOTES.txt" "v4 notes"
+Write-Host "== REQ-1: GUI(demo-gui)开着推 v4,期望优雅关闭后 swap 成功 =="
+& $Push push --target $Target --dist "$E2E\dist-v4" --main ghost-demo.exe --token $Token --timeout-secs 60
+if ($LASTEXITCODE -ne 0) { Fail "REQ-1 推 v4 失败" }
+Start-Sleep -Seconds 1
+if (Get-Process demo-gui -ErrorAction SilentlyContinue) { Fail "REQ-1 demo-gui 未被关闭" }
+if ((Invoke-RestMethod "http://$Target/update/probe").version -ne "4.0.0") { Fail "REQ-1 推送后版本非 4.0.0" }
+if ((Get-FileHash "$E2E\install\demo-gui.exe").Hash -ne (Get-FileHash "$E2E\dist-v4\demo-gui.exe").Hash) { Fail "REQ-1 demo-gui.exe 未被换新(锁未释放?)" }
+Ok "REQ-1 demo-gui 被关闭、全量 swap 成功、主程序自恢复(3.0.0 → 4.0.0)"
+
+# 11. 清理
+Get-Process ghost-demo -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process demo-gui  -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Write-Host ""
 Write-Host "E2E 全绿" -ForegroundColor Green
 ````
@@ -7689,6 +9295,205 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_
 [profile.release]
 strip = true
 lto = true
+````
+
+## File: HowToUseAutoUpdate.md
+````markdown
+# HowToUseAutoUpdate — 给你的 Rust 项目接入远程一键推更
+
+> 仓库:https://github.com/orangepro2001/AutoUpdater
+> 你只需要读完本文前两节,复制几段代码,你的服务就具备:远程推送新版 → 自动备份 → 自替换 → 自动重启 → 失败自动回滚 的完整能力。
+
+---
+
+## 0. 三十秒理解
+
+- **你的程序**(宿主)在 main 里加一行守卫 + 把一组 HTTP 路由合并进现有服务(或独立监听一个端口),不新增部署复杂度。
+- **推送端**(你自己的机器或 CI)跑 `ghost-push`,把新版 dist 目录推给目标:探测 → 上传暂存(整包 SHA256 校验)→ 触发自替换 → 轮询确认重启成功。
+- 目标机器上的流程全自动:等旧进程退出 → 备份到 `.update_backup/` → 覆盖安装目录 → 拉起新版 → 1.5s 存活判定;**失败自动回滚旧版**。`config.json` 默认永不被覆盖(各机配置不同)。
+
+```
+你的项目 main.rs(宿主)          ghost-push(推送端)
+  │ guard_apply_update()            │ 1. GET  /update/probe   探测版本
+  │ .merge(ghost_updater_net::      │ 2. POST /update/stage   传包+SHA256
+  │        routes(UpdateConfig))    │ 3. POST /update/apply   触发自替换
+  ▼                                 │ 4. 轮询 probe 直到版本/started_at 变化
+ 新进程 ← apply worker(暂存区副本)─┘   (等旧进程退出→备份→覆盖→重启→回滚兜底)
+```
+
+安全边界(强制):配了 Token 走 `Bearer` 鉴权;只配了公钥则强制 ed25519 验签;**两者都不配时更新接口直接 503 拒绝服务**,不会裸奔。
+
+---
+
+## 1. 宿主接入(三步,五分钟)
+
+### 第 1 步:加依赖
+
+```toml
+# 你项目的 Cargo.toml
+[dependencies]
+ghost-updater-core = { git = "https://github.com/orangepro2001/AutoUpdater.git" }
+ghost-updater-net  = { git = "https://github.com/orangepro2001/AutoUpdater.git" }
+# SSH 方式等价:git = "git@github.com:orangepro2001/AutoUpdater.git"
+```
+
+> core 会被 net 自动带进来,写上是为了 main.rs 里能直接 use。**不要**引 `ghost-updater-cli`——那是推送端才用的。
+
+### 第 2 步:main 顶部加守卫(必须是最先执行的一行)
+
+```rust
+fn main() {
+    // 必须在任何 runtime / 线程 / 业务初始化之前
+    ghost_updater_core::guard_apply_update();
+
+    // ↓↓ 你原有的启动代码原样保留 ↓↓
+    // ...
+}
+```
+
+这一行平时什么都不做;只有当本进程被更新流程从暂存区拉起时,它才会接管:完成换版、重启新版,然后直接退出,永不执行到你的业务代码。
+
+### 第 3 步:合并更新路由
+
+```rust
+use ghost_updater_net::UpdateConfig;
+
+let app = axum::Router::new()
+    .route("/your/api", /* 你原有的路由 */)
+    .merge(ghost_updater_net::routes(UpdateConfig {
+        version: env!("CARGO_PKG_VERSION").to_string(),  // 宿主版本号
+        auth_token: Some("换成长随机串".into()),          // 预共享 Token
+        ..Default::default()
+    }));
+```
+
+宿主不是 Axum 服务?独立起一个控制面 agent 即可(占用 1 个端口):
+
+```rust
+ghost_updater_net::start_agent("0.0.0.0:7600", env!("CARGO_PKG_VERSION"), Some("换成长随机串".into())).await?;
+```
+
+**多进程宿主(GUI + 常驻代理这类)**:再加一个 `close_processes: vec!["your-gui.exe".into()]`
+(进程映像名列表,默认空 = 原有行为)。apply 受理且鉴权通过后,agent 会优雅关闭名单内进程
+(Windows:`taskkill` 无 `/F` → 5s 宽限 → `/F` 兜底)再自退;apply worker 会等旧进程与
+名单内进程全部退出后才动文件,避免 GUI 持有包内文件导致 swap 必败。名单经白名单校验
+(仅字母数字与 `. _ -`),非法名字启动即 panic。
+
+### 第 4 步(约定):dist 里放一个 VERSION 文件
+
+你的发布产物(dist 目录)顶层放一个纯文本 `VERSION`(内容如 `2.1.0`)。推送端靠它判断"这次推送是否真的换版成功"。没有它也能推,但同版本重推时的成功判定会退化成"只确认重启"。
+
+**完成。** 编译,把 exe(连同 VERSION/config.json 等)部署到目标机,正常启动。
+
+---
+
+## 2. 推送新版
+
+在你的开发机/CI 上(装了 Rust):
+
+```bash
+# 一次性安装推送工具(装完得到 ghost-push 命令)
+cargo install --git https://github.com/orangepro2001/AutoUpdater.git ghost-updater-cli
+
+# 单目标推更
+ghost-push push --target 192.168.1.60 --dist D:\build\dist --token 换成长随机串
+
+# 多目标并发
+ghost-push push --targets-file hosts.txt --dist .\dist --token 换成长随机串 --jobs 8
+# hosts.txt 每行一个地址(IP 或 IP:端口,# 开头是注释);退出码 0 = 全部成功
+```
+
+**dist 目录要求**:顶层普通文件(exe/dll/资源),**不放子目录**;`ghost-demo.exe` 式的主程序在 dist 里必须唯一(`*.exe` 唯一,否则加 `--main xxx.exe` 指定);`config.json` 默认不推(目标机配置保留),要强推加 `--overwrite-config`。
+
+成功标志:命令打印 `[成功] ip  旧版本 → 新版本` 且退出码 0。失败时打印明细,单独 `--target` 重试失败节点即可。
+
+**目标机重启后连不上?** 先看目标机安装目录 `.update_backup\apply.log` 和 `result.json`——等旧进程超时、换文件失败、新版秒退(已自动回滚)都会记录在内。
+
+---
+
+## 3. 可选:验签模式(比 Token 更强)
+
+Token 防的是"别人能调你的更新接口";验签额外保证"推送的包本身没被篡改"。
+
+```bash
+ghost-push keygen
+# 输出:
+# sign-key(seed)  = <64位hex,私钥,只有推送端保管>
+# pubkey(hex)     = <64位hex,公钥,发给宿主>
+```
+
+宿主改为:
+
+```rust
+UpdateConfig {
+    version: ...,
+    pubkey_hex: Some("<公钥hex>".into()),   // 配了它,stage 强制验签
+    auth_token: None,                        // 二选一;两个都配则 Token 优先
+    ..Default::default()
+}
+```
+
+推送时带私钥:
+
+```bash
+ghost-push push --target 192.168.1.60 --dist .\dist --sign-key <私钥hex>
+```
+
+---
+
+## 4. 可选:图形界面推送台(Tauri)
+
+```bash
+git clone https://github.com/orangepro2001/AutoUpdater.git
+cd AutoUpdater/crates/ghost-updater-tauri
+npm install
+../../tools/gui.cmd run      # 构建前端 + 开窗口
+```
+
+`tools/gui.ps1` 是这个 GUI 的构建/运行/打包入口(cmd 下用 `tools\gui.cmd`):`run` 看界面、
+`dev` 开发热更新、`build` 只构建前端、`check` 前端+`cargo check`、`installer` 出 NSIS 安装包、
+`verify` 主 workspace build/test + GUI check。
+
+**别直接 `cargo run`**:debug 构建下 Tauri 会忽略已构建的前端,转去加载 `devUrl`
+(http://localhost:5173),而那个 Vite 服务只有 `tauri dev` 会拉起,于是窗口报
+`ERR_CONNECTION_REFUSED`。手工等价命令是 `cd src-tauri && cargo run --features tauri/custom-protocol`。
+
+功能:项目整档保存(每套 = 项目名 + 默认端口 + 机器列表 + 更新包设置「dist 目录/主程序/覆盖 config/Token/签名私钥/轮询超时」,一并持久化 apps.json),下拉切换即整档切走推送现场;批量粘贴 IP 加机器、跨项目整批导入;dist 拖入即显示版本/文件集/整包哈希;单个/选中/全部/重试失败;实时滚动日志。同一台机器上多个应用各占一个端口,每个应用存成一个项目,机器按 ip:端口 逐台配置。
+
+---
+
+## 5. 硬约束与排障速查
+
+| 事项 | 说明 |
+|---|---|
+| 更新包内容 | dist 顶层普通文件的 tar;**拒绝子目录、路径分隔符、`..`、符号链接**(防穿越) |
+| 单包上限 | 2 GiB |
+| 默认端口 | 7600(避开常见 Hyper-V 保留段;被占就换,连同 `--target ip:端口` 一起改) |
+| 重启参数 | apply 时默认按**原样透传宿主本进程的启动参数**重启,`--addr/--token` 等不会丢 |
+| 成功判定 | dist 的 VERSION 与目标旧版本不同 → 必须看到新版本;同版本重推/无 VERSION → started_at 变化即成功 |
+| 传一半断网 | 暂存区校验不过直接丢弃,运行中的主进程不受影响;重推即可 |
+| 被拒却报传输错误 | 不会了——stage/apply 拒绝前会把请求体读完再响应,流式上传大包途中被拒也能稳定看到 401/4xx |
+| 排障入口 | 目标机 `<安装目录>/.update_backup/apply.log`、`result.json`;暂存区在 `<启动目录>/.ghost-update/` |
+| 平台 | Windows 优先(生产验证);Unix 可用但等待超时后无 taskkill 兜底,超时即放弃更新(文件不动);`close_processes` 仅 Windows 生效 |
+| 回滚 | 新版 1.5s 内退出 → 自动还原备份并重拉旧版;swap 中途失败(如文件被占用)→ 当场还原已覆盖文件,`result.json` 标注"已回滚";回滚也失败会写明日志,需人工看 `.update_backup/backup-*/` |
+| apply 失败后 | 所有失败路径都会释放 `.apply-lock`,处理完占用源后**同包直接重推**即可,无需手工清锁 |
+
+**CI 集成最小示例(GitHub Actions):**
+
+```yaml
+- run: cargo install --git https://github.com/orangepro2001/AutoUpdater.git ghost-updater-cli
+- run: echo "${{ secrets.GHOST_TOKEN }}" | ghost-push push --target ${{ vars.TARGET }} --dist ./dist --token "${{ secrets.GHOST_TOKEN }}"
+```
+
+---
+
+## 6. 原理一页纸(想改代码时再看)
+
+- **workspace 结构**:`ghost-updater-core`(自替换,零网络依赖)/ `ghost-updater-net`(Axum 路由)/ `ghost-updater-cli`(推送编排 + bin)/ `demo-app`(示例宿主 + e2e)。
+- **apply worker**:apply 接口从暂存区分离拉起新版 exe,参数 `--internal-apply-update --pid <旧进程> --install <安装目录> --staging <暂存目录> [--close <进程名,进程名>] -- <原启动参数>`;worker 完成换版后 exit,宿主的 `guard_apply_update()` 在 main 顶部截获的就是这次启动。
+- **防半包**:stage 边收边算 SHA256,与查询参数不符即整目录丢弃;收完解包 tar 时再次白名单校验每个文件名。
+- **防竞态**:推送端不靠"连接断开"判断重启(网络空窗是竞态),靠 probe 返回的 `started_at`(进程启动 Unix 秒)变化。
+- **一键自测**:`powershell -ExecutionPolicy Bypass -File tools\e2e.ps1` 会在本机真实换版一轮并断言全链路。
 ````
 
 ## File: README.md
@@ -7743,12 +9548,21 @@ fn main() {
 
 安全边界(强制,二选一):配了 `auth_token` 走 Bearer;只配了 `pubkey_hex` 走验签;
 两者都没配时 stage/apply 返回 503,拒绝裸奔。probe 永远公开。
+stage/apply 拒绝(401/503/4xx)前会把请求体读完(drain,上限即单包上限)再响应,
+客户端在流式上传大包途中被拒时也能稳定看到状态码,而非随机连接重置。
 
 apply worker 的动作(core):等旧进程退出(15s 超时,Windows `taskkill /F` 兜底)→
-备份到 `<安装目录>/.update_backup/backup-<ts>/` → 覆盖安装目录(`config.json` 等未列入
-清单的文件不动)→ 分离拉起新 exe(`DETACHED_PROCESS|CREATE_NO_WINDOW`,stdio 不走管道,
-避免句柄继承死锁)→ 1.5s 存活判定健康;失败自动回滚备份并重拉旧版。
-全程写 `.update_backup/apply.log` 与 `result.json`。
+等 `close_processes` 名单内关联进程全部退出 → 备份到 `<安装目录>/.update_backup/backup-<ts>/` →
+覆盖安装目录(`config.json` 等未列入清单的文件不动)→ 分离拉起新 exe
+(`DETACHED_PROCESS|CREATE_NO_WINDOW`,stdio 不走管道,避免句柄继承死锁)→
+1.5s 存活判定健康;失败自动回滚备份并重拉旧版。swap 失败(如文件被占用)会当场
+把已覆盖的文件按备份还原(Err 时安装目录已回旧状态),且所有失败路径都会释放
+`.apply-lock`,同包可直接重推。全程写 `.update_backup/apply.log` 与 `result.json`。
+
+多进程宿主(REQ):`UpdateConfig.close_processes: Vec<String>` 填进程映像名
+(如 `vec!["app-gui.exe".into()]`);apply 受理并通过鉴权后,agent 会优雅关闭名单内进程
+(Windows:`taskkill` 无 `/F` → 5s 宽限 → `/F` 兜底)再自退;worker 等旧进程与名单内
+进程全部退出后才动文件。空名单 = 原有零配置行为。
 
 ### 3. 推送端 CLI
 
@@ -7771,13 +9585,32 @@ Hyper-V 保留段)。`config.json` 默认不推送(各机配置不同),`--overwr
 ```powershell
 cd crates\ghost-updater-tauri
 npm install
-npm run build          # 产 webdist(src-tauri 编译期要读)
-cd src-tauri
-cargo run              # 或 cargo tauri build 出 NSIS 安装包
+..\..\tools\gui.cmd run        # 构建前端 + 开窗口(等价于下面两步)
 ```
 
-功能:dist 选包预览(版本/主程序/文件集/整包哈希)、主机列表(探测/版本/状态,
-持久化 hosts.json)、单个/选中/全部/重试失败 更新、按主机着色的实时滚动日志。
+`tools\gui.ps1`(薄包装 `tools\gui.cmd`,任意目录可用)统一管这几件事:
+
+| 命令 | 作用 |
+|---|---|
+| `run` | 构建前端 + debug 编译(内嵌 webdist)+ 开窗口,日常看界面用这个 |
+| `dev` | 开发模式:`tauri dev`,自动起 Vite,改前端热更新 |
+| `build` | 只重新构建前端 → `webdist` |
+| `check` | 构建前端 + GUI crate `cargo check` |
+| `installer` | 正式打包 → NSIS 安装包 |
+| `verify` | 主 workspace `cargo build/test` + GUI check |
+
+**不要直接 `cargo run`**:debug 构建下 Tauri 会忽略已构建的 `webdist`,改让窗口去加载
+`tauri.conf.json` 的 `devUrl`(http://localhost:5173);而那个 Vite 开发服务器只有 `tauri dev`
+才会自动拉起,所以裸 `cargo run` 必然报 `ERR_CONNECTION_REFUSED`。手工等价命令是
+`cd src-tauri; cargo run --features tauri/custom-protocol`(`custom-protocol` 让编译期改用
+内嵌 webdist,不再走 devUrl);脚本的 `run` 用的是官方 CLI 路径 `tauri build --debug --no-bundle`,
+顺带把上一次运行残留的实例关掉(否则旧进程锁住 exe,cargo 覆盖报 os error 5)。
+
+功能:项目整档保存(每套 = 项目名/默认端口/机器列表 + 该应用的更新包设置:dist 目录、
+主程序、覆盖 config、Token、签名私钥、轮询超时,一并持久化 apps.json,下拉即切换整个
+推送现场)、批量粘贴 IP 一次加机器、从其他项目整批导入机器、dist 选包预览(版本/
+主程序/文件集/整包哈希)、单个/选中/全部/重试失败 更新、按主机着色的实时滚动日志。
+同一台机器上多个应用各占一个端口,每个应用存成一个项目,机器按 ip:端口 逐台配置。
 
 ## 构建与测试
 

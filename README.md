@@ -48,12 +48,21 @@ fn main() {
 
 安全边界(强制,二选一):配了 `auth_token` 走 Bearer;只配了 `pubkey_hex` 走验签;
 两者都没配时 stage/apply 返回 503,拒绝裸奔。probe 永远公开。
+stage/apply 拒绝(401/503/4xx)前会把请求体读完(drain,上限即单包上限)再响应,
+客户端在流式上传大包途中被拒时也能稳定看到状态码,而非随机连接重置。
 
 apply worker 的动作(core):等旧进程退出(15s 超时,Windows `taskkill /F` 兜底)→
-备份到 `<安装目录>/.update_backup/backup-<ts>/` → 覆盖安装目录(`config.json` 等未列入
-清单的文件不动)→ 分离拉起新 exe(`DETACHED_PROCESS|CREATE_NO_WINDOW`,stdio 不走管道,
-避免句柄继承死锁)→ 1.5s 存活判定健康;失败自动回滚备份并重拉旧版。
-全程写 `.update_backup/apply.log` 与 `result.json`。
+等 `close_processes` 名单内关联进程全部退出 → 备份到 `<安装目录>/.update_backup/backup-<ts>/` →
+覆盖安装目录(`config.json` 等未列入清单的文件不动)→ 分离拉起新 exe
+(`DETACHED_PROCESS|CREATE_NO_WINDOW`,stdio 不走管道,避免句柄继承死锁)→
+1.5s 存活判定健康;失败自动回滚备份并重拉旧版。swap 失败(如文件被占用)会当场
+把已覆盖的文件按备份还原(Err 时安装目录已回旧状态),且所有失败路径都会释放
+`.apply-lock`,同包可直接重推。全程写 `.update_backup/apply.log` 与 `result.json`。
+
+多进程宿主(REQ):`UpdateConfig.close_processes: Vec<String>` 填进程映像名
+(如 `vec!["app-gui.exe".into()]`);apply 受理并通过鉴权后,agent 会优雅关闭名单内进程
+(Windows:`taskkill` 无 `/F` → 5s 宽限 → `/F` 兜底)再自退;worker 等旧进程与名单内
+进程全部退出后才动文件。空名单 = 原有零配置行为。
 
 ### 3. 推送端 CLI
 
@@ -76,13 +85,32 @@ Hyper-V 保留段)。`config.json` 默认不推送(各机配置不同),`--overwr
 ```powershell
 cd crates\ghost-updater-tauri
 npm install
-npm run build          # 产 webdist(src-tauri 编译期要读)
-cd src-tauri
-cargo run              # 或 cargo tauri build 出 NSIS 安装包
+..\..\tools\gui.cmd run        # 构建前端 + 开窗口(等价于下面两步)
 ```
 
-功能:dist 选包预览(版本/主程序/文件集/整包哈希)、主机列表(探测/版本/状态,
-持久化 hosts.json)、单个/选中/全部/重试失败 更新、按主机着色的实时滚动日志。
+`tools\gui.ps1`(薄包装 `tools\gui.cmd`,任意目录可用)统一管这几件事:
+
+| 命令 | 作用 |
+|---|---|
+| `run` | 构建前端 + debug 编译(内嵌 webdist)+ 开窗口,日常看界面用这个 |
+| `dev` | 开发模式:`tauri dev`,自动起 Vite,改前端热更新 |
+| `build` | 只重新构建前端 → `webdist` |
+| `check` | 构建前端 + GUI crate `cargo check` |
+| `installer` | 正式打包 → NSIS 安装包 |
+| `verify` | 主 workspace `cargo build/test` + GUI check |
+
+**不要直接 `cargo run`**:debug 构建下 Tauri 会忽略已构建的 `webdist`,改让窗口去加载
+`tauri.conf.json` 的 `devUrl`(http://localhost:5173);而那个 Vite 开发服务器只有 `tauri dev`
+才会自动拉起,所以裸 `cargo run` 必然报 `ERR_CONNECTION_REFUSED`。手工等价命令是
+`cd src-tauri; cargo run --features tauri/custom-protocol`(`custom-protocol` 让编译期改用
+内嵌 webdist,不再走 devUrl);脚本的 `run` 用的是官方 CLI 路径 `tauri build --debug --no-bundle`,
+顺带把上一次运行残留的实例关掉(否则旧进程锁住 exe,cargo 覆盖报 os error 5)。
+
+功能:项目整档保存(每套 = 项目名/默认端口/机器列表 + 该应用的更新包设置:dist 目录、
+主程序、覆盖 config、Token、签名私钥、轮询超时,一并持久化 apps.json,下拉即切换整个
+推送现场)、批量粘贴 IP 一次加机器、从其他项目整批导入机器、dist 选包预览(版本/
+主程序/文件集/整包哈希)、单个/选中/全部/重试失败 更新、按主机着色的实时滚动日志。
+同一台机器上多个应用各占一个端口,每个应用存成一个项目,机器按 ip:端口 逐台配置。
 
 ## 构建与测试
 

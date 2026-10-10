@@ -6,14 +6,17 @@
 //! 否则立即返回,走正常业务逻辑。
 //!
 //! apply worker 流程(全程阻塞 std,必须在 tokio runtime 建立前执行):
-//!   1. 解析 --pid/--install/--staging(/--from),读暂存区 manifest.json
+//!   1. 解析 --pid/--install/--staging(/--from/--close),读暂存区 manifest.json
 //!   2. 等旧进程(pid)退出:轮询 process_alive,超时 taskkill /F 兜底
+//!   2.5 等 --close 列出的关联进程退出(多进程宿主:agent 侧已优雅关闭,这里兜底等待/强杀)
 //!   3. 备份安装目录将被覆盖的文件 → <install>/.update_backup/backup-<ts>/
-//!   4. 用暂存文件覆盖安装目录(整体预校验后再动,保留未列入清单的配置文件)
+//!   4. 用暂存文件覆盖安装目录(整体预校验后再动,保留未列入清单的配置文件;
+//!      覆盖段中途失败当场按备份逐文件还原,Err 时 install 已回到旧状态)
 //!   5. 分离拉起安装目录的新 exe(DETACHED|CREATE_NO_WINDOW,stdio 直弃,
 //!      严禁管道捕获 —— 孙进程继承管道写句柄会导致等 EOF 永久卡死),1.5s
 //!      存活判定为健康
-//!   6. 失败回滚:还原备份、删本次新增文件、重拉旧 exe;apply.log/result.json 记录全程
+//!   6. 失败回滚:还原备份、删本次新增文件、重拉旧 exe;apply.log/result.json 记录全程;
+//!      所有失败路径(含备份/覆盖段)统一由 run_apply 收口释放 .apply-lock
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -109,6 +112,123 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// 进程映像名白名单:只允许 ASCII 字母数字与 `. _ -`,杜绝 taskkill/tasklist 参数注入。
+pub fn validate_process_names(names: &[String]) -> Result<(), String> {
+    for n in names {
+        if n.is_empty()
+            || !n
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        {
+            return Err(format!("进程名只允许字母数字与 ._-: {n:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// 进程映像名是否在运行。Windows: tasklist CSV 首列精确比对(GBK 输出里文件名段
+/// 是 ASCII,utf8_lossy 不损伤);非 Windows 恒 false(close/wait 均为 no-op)。
+pub fn process_running_by_name(name: &str) -> bool {
+    #[cfg(windows)]
+    {
+        let Ok(out) = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("IMAGENAME eq {name}"), "/FO", "CSV", "/NH"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            return false;
+        };
+        String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+            let first = line.split(',').next().unwrap_or("").trim_matches('"');
+            first.eq_ignore_ascii_case(name)
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = name;
+        false
+    }
+}
+
+fn taskkill_image(name: &str, force: bool) {
+    let mut args = vec!["/IM".to_string(), name.to_string()];
+    if force {
+        args.push("/F".to_string());
+    }
+    let _ = std::process::Command::new("taskkill")
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// 优雅关闭一批进程(REQ-1):Windows 先 `taskkill /IM`(无 /F = WM_CLOSE),
+/// grace 内轮询,残留再 `/F` 兜底。Err = 仍有进程关不掉(需人工介入)。
+/// 非 Windows no-op(REQ:可先留空实现)。
+pub fn close_processes_graceful(names: &[String], grace: Duration) -> Result<(), String> {
+    validate_process_names(names)?;
+    #[cfg(windows)]
+    {
+        let mut stubborn = Vec::new();
+        for n in names {
+            taskkill_image(n, false);
+            let deadline = std::time::Instant::now() + grace;
+            while process_running_by_name(n) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            if process_running_by_name(n) {
+                taskkill_image(n, true);
+                std::thread::sleep(Duration::from_millis(500));
+                if process_running_by_name(n) {
+                    stubborn.push(n.clone());
+                }
+            }
+        }
+        if stubborn.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("以下进程未能关闭: {}", stubborn.join(", ")))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (names, grace);
+        Ok(())
+    }
+}
+
+/// 等待一批进程映像名全部退出:轮询,超时逐个 taskkill /F 兜底(镜像 wait_pid_exit 语义)。
+/// 名单非法视为配置错误,返回 false(放弃更新)。非 Windows 恒 true(与 no-op close 配套)。
+pub fn wait_processes_exit(names: &[String], timeout: Duration) -> bool {
+    if validate_process_names(names).is_err() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if names.iter().all(|n| !process_running_by_name(n)) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        for n in names {
+            taskkill_image(n, true);
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        names.iter().all(|n| !process_running_by_name(n))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (names, timeout);
+        true
+    }
+}
+
 /// main 顶部拦截:检测 `--internal-apply-update`,是 apply worker 就地完成换版并 exit,
 /// 永不返回;否则直接 return,宿主继续正常启动。
 pub fn guard_apply_update() {
@@ -139,6 +259,8 @@ struct ApplyArgs {
     install: PathBuf,
     staging: PathBuf,
     from_version: String,
+    /// 需一并等待退出的关联进程映像名(net 侧 --close 传入;agent 已做过优雅关闭)
+    close: Vec<String>,
 }
 
 fn parse_apply_args(argv: &[String]) -> Result<ApplyArgs, String> {
@@ -146,6 +268,7 @@ fn parse_apply_args(argv: &[String]) -> Result<ApplyArgs, String> {
     let mut install = None;
     let mut staging = None;
     let mut from = String::new();
+    let mut close = Vec::new();
     let mut i = 0;
     while i < argv.len() {
         let val = |i: usize| argv.get(i + 1).ok_or_else(|| format!("{} 缺值", argv[i]));
@@ -154,6 +277,14 @@ fn parse_apply_args(argv: &[String]) -> Result<ApplyArgs, String> {
             "--install" => install = Some(PathBuf::from(val(i)?)),
             "--staging" => staging = Some(PathBuf::from(val(i)?)),
             "--from" => from = val(i)?.clone(),
+            "--close" => {
+                close = val(i)?
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                validate_process_names(&close)?;
+            }
             other => return Err(format!("未知参数: {other}")),
         }
         i += 2;
@@ -163,11 +294,19 @@ fn parse_apply_args(argv: &[String]) -> Result<ApplyArgs, String> {
         install: install.ok_or("缺少 --install")?,
         staging: staging.ok_or("缺少 --staging")?,
         from_version: from,
+        close,
     })
 }
 
 fn run_apply(argv: &[String], relaunch_args: &[String]) -> Result<(), String> {
     let a = parse_apply_args(argv)?;
+    let r = run_apply_inner(&a, relaunch_args);
+    // 锁收口:成功/任何失败路径统一在这里释放,失败不再泄漏 .apply-lock(REQ-2)
+    release_lock(&a.staging);
+    r
+}
+
+fn run_apply_inner(a: &ApplyArgs, relaunch_args: &[String]) -> Result<(), String> {
     let update_dir = a.install.join(UPDATE_DIR_NAME);
     std::fs::create_dir_all(&update_dir)
         .map_err(|e| format!("创建 {} 失败: {e}", update_dir.display()))?;
@@ -206,11 +345,36 @@ fn run_apply(argv: &[String], relaunch_args: &[String]) -> Result<(), String> {
     }
     std::thread::sleep(Duration::from_millis(300)); // 句柄释放缓冲
 
-    // 2+3. 备份 + 覆盖
+    // 1.5 等关联进程退出(REQ-1 多进程宿主:agent 侧已优雅关闭,这里兜底等待 + taskkill /F)
+    if !a.close.is_empty() {
+        if !wait_processes_exit(&a.close, Duration::from_secs(10)) {
+            let msg = format!(
+                "关联进程({}) 10s 内未退出,放弃更新(文件未动)",
+                a.close.join(",")
+            );
+            log_line(&log_path, &msg);
+            write_result(&update_dir, false, &a.from_version, &manifest.files, &msg);
+            return Err(msg);
+        }
+    }
+
+    // 2+3. 备份 + 覆盖(分段:备份段失败文件未动;覆盖段失败由 overwrite_files 当场还原,
+    //      只还原已覆盖的文件 —— 不碰未覆盖的旧文件,避免 remove 旧文件被外部句柄锁卡死)
     let backup_dir = update_dir.join(format!("backup-{}", unix_secs()));
-    if let Err(e) = swap_files(&a.install, &a.staging, &manifest.files, &backup_dir) {
-        let msg = format!("文件替换失败: {e}(文件未动或部分覆盖,见备份)");
+    if let Err(e) = ensure_staged(&a.staging, &manifest.files)
+        .and_then(|_| backup_files(&a.install, &manifest.files, &backup_dir))
+    {
+        let msg = format!("暂存/备份失败: {e}(文件未动)");
         log_line(&log_path, &msg);
+        write_result(&update_dir, false, &a.from_version, &manifest.files, &msg);
+        return Err(msg);
+    }
+    if let Err(e) = overwrite_files(&a.install, &a.staging, &manifest.files, &backup_dir) {
+        log_line(&log_path, &format!("文件替换失败: {e};重拉旧版恢复服务"));
+        if !manifest.main.is_empty() {
+            let _ = start_detached(&a.install.join(&manifest.main), &a.install, &[], None);
+        }
+        let msg = format!("文件替换失败: {e}");
         write_result(&update_dir, false, &a.from_version, &manifest.files, &msg);
         return Err(msg);
     }
@@ -232,7 +396,6 @@ fn run_apply(argv: &[String], relaunch_args: &[String]) -> Result<(), String> {
             std::thread::sleep(Duration::from_millis(1500));
             if child_still_alive(&mut child) {
                 let _ = std::fs::remove_dir_all(&backup_dir); // 成功清备份
-                release_lock(&a.staging);
                 log_line(&log_path, &format!("更新成功,新进程 pid={} 存活", child.id()));
                 write_result(&update_dir, true, &a.from_version, &manifest.files, "");
                 Ok(())
@@ -267,15 +430,20 @@ fn rollback(install: &Path, backup_dir: &Path, files: &[String], main: &str, log
     }
 }
 
-/// 备份 + 覆盖:先整体校验暂存源齐全且文件名扁平,再备份安装目录现存文件,最后覆盖。
-/// 返回后 install = 暂存内容;未列入 files 的既有文件(如 config.json)不动。
-pub fn swap_files(install: &Path, staging: &Path, files: &[String], backup_dir: &Path) -> Result<(), String> {
+/// 暂存区预检:文件名扁平 + 源文件齐全。失败 = 安装目录保证未动。
+fn ensure_staged(staging: &Path, files: &[String]) -> Result<(), String> {
     validate_file_names(files)?;
     for f in files {
         if !staging.join(f).is_file() {
             return Err(format!("暂存区缺少文件: {}", staging.join(f).display()));
         }
     }
+    Ok(())
+}
+
+/// 备份安装目录现存文件(不覆盖;失败时 install 未动过)。
+pub fn backup_files(install: &Path, files: &[String], backup_dir: &Path) -> Result<(), String> {
+    validate_file_names(files)?;
     std::fs::create_dir_all(backup_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
     for f in files {
         let dst = install.join(f);
@@ -283,10 +451,55 @@ pub fn swap_files(install: &Path, staging: &Path, files: &[String], backup_dir: 
             std::fs::copy(&dst, backup_dir.join(f)).map_err(|e| format!("备份 {f} 失败: {e}"))?;
         }
     }
+    Ok(())
+}
+
+/// 用暂存文件覆盖安装目录(调用前必须已 backup_files)。
+/// 覆盖段中途失败:已覆盖的文件当场按备份逐个还原、本次新增(备份里没有的)删除,
+/// 返回 Err 时 install 已回到旧状态 —— 只动确实覆盖过的文件,未覆盖的旧文件
+/// (可能仍被外部句柄锁着)绝不 remove,所以还原不会被锁卡死。
+pub fn overwrite_files(
+    install: &Path,
+    staging: &Path,
+    files: &[String],
+    backup_dir: &Path,
+) -> Result<(), String> {
+    validate_file_names(files)?;
+    let mut done: Vec<&String> = Vec::new();
     for f in files {
-        std::fs::copy(staging.join(f), install.join(f)).map_err(|e| format!("覆盖 {f} 失败: {e}"))?;
+        match std::fs::copy(staging.join(f), install.join(f)) {
+            Ok(_) => done.push(f),
+            Err(e) => {
+                let mut bad: Vec<String> = Vec::new();
+                for f2 in done {
+                    let bak = backup_dir.join(f2);
+                    let r = if bak.is_file() {
+                        std::fs::copy(&bak, install.join(f2)).map(|_| ())
+                    } else {
+                        std::fs::remove_file(install.join(f2)) // 本次新增的,删掉
+                    };
+                    if let Err(e2) = r {
+                        bad.push(format!("还原 {f2}: {e2}"));
+                    }
+                }
+                return Err(if bad.is_empty() {
+                    format!("覆盖 {f} 失败: {e}(已回滚到旧状态)")
+                } else {
+                    format!("覆盖 {f} 失败: {e}(回滚失败,需人工介入: {})", bad.join("; "))
+                });
+            }
+        }
     }
     Ok(())
+}
+
+/// 备份 + 覆盖:先整体校验暂存源齐全且文件名扁平,再备份安装目录现存文件,最后覆盖。
+/// 返回后 install = 暂存内容;未列入 files 的既有文件(如 config.json)不动。
+/// 覆盖段失败的还原语义见 overwrite_files(Err 时 install 已回旧状态)。
+pub fn swap_files(install: &Path, staging: &Path, files: &[String], backup_dir: &Path) -> Result<(), String> {
+    ensure_staged(staging, files)?;
+    backup_files(install, files, backup_dir)?;
+    overwrite_files(install, staging, files, backup_dir)
 }
 
 /// 回滚:备份里有的恢复原样;备份里没有的(本次新增)删除。
@@ -383,6 +596,13 @@ fn log_line(path: &Path, msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(f, "[{}] {}", unix_secs(), msg);
     }
+}
+
+/// 宿主侧(agent)向 apply.log 追记一行(如 close_processes 关闭动作),与 worker 日志同文件。
+pub fn append_apply_log(install: &Path, msg: &str) {
+    let dir = install.join(UPDATE_DIR_NAME);
+    let _ = std::fs::create_dir_all(&dir);
+    log_line(&dir.join("apply.log"), msg);
 }
 
 fn write_result(update_dir: &Path, ok: bool, from: &str, files: &[String], error: &str) {
@@ -535,6 +755,103 @@ mod tests {
         assert!(w.contains(&"--install".to_string()));
         assert_eq!(r, vec!["--serve".to_string(), ":80".to_string()]);
         assert!(split_at_flag(&["--foo".to_string()]).is_none());
+    }
+
+    #[test]
+    fn parse_close_processes_arg() {
+        let args: Vec<String> = ["--install", "I", "--staging", "S", "--close", "gui.exe, helper.exe ,"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let a = parse_apply_args(&args).unwrap();
+        assert_eq!(a.close, vec!["gui.exe".to_string(), "helper.exe".to_string()]);
+        assert!(parse_apply_args(&["--close".to_string(), "a b.exe".to_string()]).is_err());
+    }
+
+    #[test]
+    fn process_names_whitelist_rejects_injection() {
+        validate_process_names(&["demo-gui.exe".into(), "My_App-2.exe".into()]).unwrap();
+        for bad in ["a b.exe", "a\"b", "a/b", "a\\b", "a;b", "", "a|b"] {
+            assert!(validate_process_names(&[bad.to_string()]).is_err(), "{bad}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_running_by_name_detects_cmd_child() {
+        let _c = dummy_child(5);
+        assert!(process_running_by_name("cmd.exe"));
+        assert!(!process_running_by_name("ghost-updater-no-such-proc.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wait_processes_exit_fast_for_absent_name() {
+        let t = std::time::Instant::now();
+        assert!(wait_processes_exit(&["ghost-updater-no-such-proc.exe".into()], Duration::from_secs(5)));
+        assert!(t.elapsed() < Duration::from_secs(2), "不存在名不应等到超时");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn close_processes_graceful_ok_for_absent_name() {
+        assert!(close_processes_graceful(
+            &["ghost-updater-no-such-proc.exe".into()],
+            Duration::from_millis(500)
+        )
+        .is_ok());
+    }
+
+    /// REQ-2 验收:锁住安装目录文件逼停覆盖段 → Err 含"已回滚"、install 回旧状态、
+    /// 暂存区无 .apply-lock、result.json ok:false。share_mode(1)=FILE_SHARE_READ:
+    /// 备份可读、覆盖写必败(os error 32),正好落在覆盖段失败分支。
+    #[cfg(windows)]
+    #[test]
+    fn swap_failure_rolls_back_and_releases_lock() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let install = temp_dir("roll-install");
+        let staging = temp_dir("roll-staging");
+        put(&install, "app.txt", b"old-app");
+        put(&install, "locked.bin", b"old-locked");
+        put(&staging, "app.txt", b"new-app");
+        put(&staging, "locked.bin", b"new-locked");
+        std::fs::write(
+            staging.join("manifest.json"),
+            serde_json::to_string(&StageManifest {
+                files: vec!["app.txt".into(), "locked.bin".into()],
+                sha256: "0".into(),
+                main: "app.txt".into(), // 非 exe,回滚重拉会静默失败,单测无副作用
+                staged_at: 0,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        acquire_apply_lock(&staging).unwrap();
+
+        let _guard = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ:他人可读不可写
+            .open(install.join("locked.bin"))
+            .unwrap();
+
+        let argv: Vec<String> = [
+            "--install",
+            install.to_str().unwrap(),
+            "--staging",
+            staging.to_str().unwrap(),
+            "--from",
+            "1.0.0",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let err = run_apply(&argv, &[]).unwrap_err();
+        assert!(err.contains("已回滚"), "err={err}");
+        assert_eq!(get(&install, "app.txt"), b"old-app"); // 已覆盖的被还原
+        assert_eq!(get(&install, "locked.bin"), b"old-locked"); // 未覆盖的原样
+        assert!(!staging.join(APPLY_LOCK_NAME).exists()); // 锁已释放,可重推
+        let result = std::fs::read_to_string(install.join(UPDATE_DIR_NAME).join("result.json")).unwrap();
+        assert!(result.contains("\"ok\":false") && result.contains("已回滚"), "result={result}");
     }
 
     fn dummy_child(sleep_secs: u32) -> std::process::Child {

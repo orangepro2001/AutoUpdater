@@ -49,11 +49,21 @@ pub struct UpdateConfig {
     pub install_dir: Option<PathBuf>,
     /// 暂存根目录(默认 cwd 相对 .ghost-update/)
     pub staging_root: Option<PathBuf>,
+    /// apply 受理后需优雅关闭的本机进程映像名(REQ-1 多进程宿主编排;空 = 现状零改动)。
+    /// agent 关闭 → 自退;worker 会再兜底等待名单内进程全部退出才动文件。
+    pub close_processes: Vec<String>,
 }
 
 impl UpdateConfig {
     pub fn new(version: impl Into<String>) -> Self {
-        Self { version: version.into(), auth_token: None, pubkey_hex: None, install_dir: None, staging_root: None }
+        Self {
+            version: version.into(),
+            auth_token: None,
+            pubkey_hex: None,
+            install_dir: None,
+            staging_root: None,
+            close_processes: Vec::new(),
+        }
     }
 }
 
@@ -81,6 +91,9 @@ pub fn routes(cfg: UpdateConfig) -> Router {
         None => (None, String::new()),
     };
     let staging_root = cfg.staging_root.clone().unwrap_or_else(|| PathBuf::from(STAGING_ROOT));
+    if let Err(e) = ghost_updater_core::validate_process_names(&cfg.close_processes) {
+        panic!("close_processes 非法: {e}");
+    }
     Router::new()
         .route("/update/probe", get(probe))
         .route("/update/stage", post(stage))
@@ -134,12 +147,15 @@ async fn stage(
     body: Body,
 ) -> Response {
     if let Err(r) = check_auth(&st, &headers) {
+        drain_body(body).await;
         return r;
     }
     if q.sha256.len() != 64 || hex::decode(&q.sha256).is_err() {
+        drain_body(body).await;
         return err(StatusCode::BAD_REQUEST, "sha256 必须是 64 位 hex");
     }
     if let Err(e) = ghost_updater_core::validate_file_names(std::slice::from_ref(&q.main)) {
+        drain_body(body).await;
         return err(StatusCode::BAD_REQUEST, &format!("main 非法: {e}"));
     }
 
@@ -240,6 +256,31 @@ async fn stream_to_file(body: Body, path: &Path, hasher: &mut Sha256) -> Result<
     Ok(total)
 }
 
+/// 把未消费的请求体读完再响应(REQ-3):axum/hyper 对未读 body 的请求发完响应即断连,
+/// 客户端若仍在流式上传大包体,看到的是连接重置而非 401/4xx,错误表现随机、E2E 无法断言。
+/// 上限 MAX_PACKAGE_BYTES(超限放弃、断连可接受),整体 30s 超时不伺候慢速攻击。
+async fn drain_body(body: Body) {
+    use http_body_util::BodyExt;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+        let mut body = body;
+        let mut total: u64 = 0;
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(f) => {
+                    if let Some(d) = f.data_ref() {
+                        total += d.len() as u64;
+                    }
+                    if total > MAX_PACKAGE_BYTES {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+    .await;
+}
+
 /// 解包 tar 到 dir,只接受扁平普通文件;返回文件名列表。
 fn unpack_flat(pkg: &Path, dir: &Path) -> Result<Vec<String>, String> {
     let mut ar = tar::Archive::new(std::fs::File::open(pkg).map_err(|e| format!("开包: {e}"))?);
@@ -324,6 +365,11 @@ async fn apply(State(st): State<UpdateState>, headers: HeaderMap, body: String) 
         "--from".into(),
         st.cfg.version.clone(),
     ];
+    // REQ-1:worker 要等这些关联进程退出后才动文件,名单经 argv 交接
+    if !st.cfg.close_processes.is_empty() {
+        argv.push("--close".into());
+        argv.push(st.cfg.close_processes.join(","));
+    }
     if !relaunch_args.is_empty() {
         argv.push("--".into());
         argv.extend(relaunch_args);
@@ -333,9 +379,30 @@ async fn apply(State(st): State<UpdateState>, headers: HeaderMap, body: String) 
         return err(StatusCode::INTERNAL_SERVER_ERROR, &format!("拉起 apply worker 失败: {e}"));
     }
 
-    // ack 已代表受理;留出响应回程时间后自退,接力棒交给暂存区里的新 exe
-    tokio::spawn(async {
+    // ack 已代表受理;留出响应回程时间后:优雅关闭 close_processes → 自退,
+    // 接力棒交给暂存区里的新 exe(worker 会等 --pid 即本进程退出)
+    let install_for_log = install.clone();
+    let close_list = st.cfg.close_processes.clone();
+    tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        if !close_list.is_empty() {
+            ghost_updater_core::append_apply_log(
+                &install_for_log,
+                &format!("apply 受理,优雅关闭关联进程: {}", close_list.join(", ")),
+            );
+            let closed = tokio::task::spawn_blocking(move || {
+                ghost_updater_core::close_processes_graceful(&close_list, std::time::Duration::from_secs(5))
+            })
+            .await;
+            match closed {
+                Ok(Ok(())) => ghost_updater_core::append_apply_log(&install_for_log, "关联进程已全部关闭,代理自退"),
+                Ok(Err(e)) => ghost_updater_core::append_apply_log(
+                    &install_for_log,
+                    &format!("关联进程关闭失败: {e}(代理自退,worker 会兜底等待/强杀)"),
+                ),
+                Err(e) => ghost_updater_core::append_apply_log(&install_for_log, &format!("关闭任务异常: {e}")),
+            }
+        }
         std::process::exit(0);
     });
     Json(json!({ "ok": true, "staging": staging_dir_name(&staging_abs), "pid": std::process::id() }))
@@ -523,6 +590,34 @@ mod tests {
         let (app, _root) = app_with(UpdateConfig { auth_token: Some("secret".into()), ..UpdateConfig::new("1.0.0") }, "badtok");
         let (code, _) = stage_req(app, "/update/stage?sha256=x&main=a.exe".into(), auth("Bearer wrong"), vec![]).await;
         assert_eq!(code, StatusCode::UNAUTHORIZED);
+    }
+
+    /// REQ-3 验收:拒绝路径必须把请求体 drain 完再回 401,否则 hyper 对未消费 body
+    /// 的请求发完响应即断连,仍在流式上传的客户端只会看到连接重置。真实 TCP 全双工验证
+    /// (内存 oneshot 测不出连接行为):客户端边写 3MiB 边等,无 drain 时写/读必炸一个。
+    #[tokio::test]
+    async fn stage_wrong_token_big_body_still_401_over_tcp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (app, _root) = app_with(UpdateConfig { auth_token: Some("t".into()), ..UpdateConfig::new("1.0.0") }, "drain401");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = "POST /update/stage?sha256=ab&main=a.exe HTTP/1.1\r\n\
+                    Host: e2e\r\nAuthorization: Bearer wrong\r\nContent-Length: 3145728\r\n\
+                    Connection: close\r\n\r\n";
+        s.write_all(head.as_bytes()).await.unwrap();
+        let chunk = vec![0u8; 65536];
+        for _ in 0..48 {
+            s.write_all(&chunk).await.unwrap();
+        }
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf).await;
+        let head_str = String::from_utf8_lossy(&buf[..buf.len().min(2048)]).to_string();
+        assert!(head_str.starts_with("HTTP/1.1 401"), "应读到 401,实际: {head_str}");
     }
 
     #[tokio::test]

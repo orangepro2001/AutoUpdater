@@ -72,6 +72,12 @@ let app = axum::Router::new()
 ghost_updater_net::start_agent("0.0.0.0:7600", env!("CARGO_PKG_VERSION"), Some("换成长随机串".into())).await?;
 ```
 
+**多进程宿主(GUI + 常驻代理这类)**:再加一个 `close_processes: vec!["your-gui.exe".into()]`
+(进程映像名列表,默认空 = 原有行为)。apply 受理且鉴权通过后,agent 会优雅关闭名单内进程
+(Windows:`taskkill` 无 `/F` → 5s 宽限 → `/F` 兜底)再自退;apply worker 会等旧进程与
+名单内进程全部退出后才动文件,避免 GUI 持有包内文件导致 swap 必败。名单经白名单校验
+(仅字母数字与 `. _ -`),非法名字启动即 panic。
+
 ### 第 4 步(约定):dist 里放一个 VERSION 文件
 
 你的发布产物(dist 目录)顶层放一个纯文本 `VERSION`(内容如 `2.1.0`)。推送端靠它判断"这次推送是否真的换版成功"。没有它也能推,但同版本重推时的成功判定会退化成"只确认重启"。
@@ -139,11 +145,19 @@ ghost-push push --target 192.168.1.60 --dist .\dist --sign-key <私钥hex>
 ```bash
 git clone https://github.com/orangepro2001/AutoUpdater.git
 cd AutoUpdater/crates/ghost-updater-tauri
-npm install && npm run build
-cd src-tauri && cargo run        # 或 cargo tauri build 出安装包
+npm install
+../../tools/gui.cmd run      # 构建前端 + 开窗口
 ```
 
-功能:dist 拖入即显示版本/文件集/整包哈希;主机列表持久化;单个/选中/全部/重试失败;实时滚动日志。
+`tools/gui.ps1` 是这个 GUI 的构建/运行/打包入口(cmd 下用 `tools\gui.cmd`):`run` 看界面、
+`dev` 开发热更新、`build` 只构建前端、`check` 前端+`cargo check`、`installer` 出 NSIS 安装包、
+`verify` 主 workspace build/test + GUI check。
+
+**别直接 `cargo run`**:debug 构建下 Tauri 会忽略已构建的前端,转去加载 `devUrl`
+(http://localhost:5173),而那个 Vite 服务只有 `tauri dev` 会拉起,于是窗口报
+`ERR_CONNECTION_REFUSED`。手工等价命令是 `cd src-tauri && cargo run --features tauri/custom-protocol`。
+
+功能:项目整档保存(每套 = 项目名 + 默认端口 + 机器列表 + 更新包设置「dist 目录/主程序/覆盖 config/Token/签名私钥/轮询超时」,一并持久化 apps.json),下拉切换即整档切走推送现场;批量粘贴 IP 加机器、跨项目整批导入;dist 拖入即显示版本/文件集/整包哈希;单个/选中/全部/重试失败;实时滚动日志。同一台机器上多个应用各占一个端口,每个应用存成一个项目,机器按 ip:端口 逐台配置。
 
 ---
 
@@ -157,9 +171,11 @@ cd src-tauri && cargo run        # 或 cargo tauri build 出安装包
 | 重启参数 | apply 时默认按**原样透传宿主本进程的启动参数**重启,`--addr/--token` 等不会丢 |
 | 成功判定 | dist 的 VERSION 与目标旧版本不同 → 必须看到新版本;同版本重推/无 VERSION → started_at 变化即成功 |
 | 传一半断网 | 暂存区校验不过直接丢弃,运行中的主进程不受影响;重推即可 |
+| 被拒却报传输错误 | 不会了——stage/apply 拒绝前会把请求体读完再响应,流式上传大包途中被拒也能稳定看到 401/4xx |
 | 排障入口 | 目标机 `<安装目录>/.update_backup/apply.log`、`result.json`;暂存区在 `<启动目录>/.ghost-update/` |
-| 平台 | Windows 优先(生产验证);Unix 可用但等待超时后无 taskkill 兜底,超时即放弃更新(文件不动) |
-| 回滚 | 新版 1.5s 内退出 → 自动还原备份并重拉旧版;回滚也失败会写明日志,需人工看 `.update_backup/backup-*/` |
+| 平台 | Windows 优先(生产验证);Unix 可用但等待超时后无 taskkill 兜底,超时即放弃更新(文件不动);`close_processes` 仅 Windows 生效 |
+| 回滚 | 新版 1.5s 内退出 → 自动还原备份并重拉旧版;swap 中途失败(如文件被占用)→ 当场还原已覆盖文件,`result.json` 标注"已回滚";回滚也失败会写明日志,需人工看 `.update_backup/backup-*/` |
+| apply 失败后 | 所有失败路径都会释放 `.apply-lock`,处理完占用源后**同包直接重推**即可,无需手工清锁 |
 
 **CI 集成最小示例(GitHub Actions):**
 
@@ -173,7 +189,7 @@ cd src-tauri && cargo run        # 或 cargo tauri build 出安装包
 ## 6. 原理一页纸(想改代码时再看)
 
 - **workspace 结构**:`ghost-updater-core`(自替换,零网络依赖)/ `ghost-updater-net`(Axum 路由)/ `ghost-updater-cli`(推送编排 + bin)/ `demo-app`(示例宿主 + e2e)。
-- **apply worker**:apply 接口从暂存区分离拉起新版 exe,参数 `--internal-apply-update --pid <旧进程> --install <安装目录> --staging <暂存目录> -- <原启动参数>`;worker 完成换版后 exit,宿主的 `guard_apply_update()` 在 main 顶部截获的就是这次启动。
+- **apply worker**:apply 接口从暂存区分离拉起新版 exe,参数 `--internal-apply-update --pid <旧进程> --install <安装目录> --staging <暂存目录> [--close <进程名,进程名>] -- <原启动参数>`;worker 完成换版后 exit,宿主的 `guard_apply_update()` 在 main 顶部截获的就是这次启动。
 - **防半包**:stage 边收边算 SHA256,与查询参数不符即整目录丢弃;收完解包 tar 时再次白名单校验每个文件名。
 - **防竞态**:推送端不靠"连接断开"判断重启(网络空窗是竞态),靠 probe 返回的 `started_at`(进程启动 Unix 秒)变化。
 - **一键自测**:`powershell -ExecutionPolicy Bypass -File tools\e2e.ps1` 会在本机真实换版一轮并断言全链路。
